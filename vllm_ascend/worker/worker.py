@@ -516,7 +516,11 @@ class NPUWorker(WorkerBase):
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass:
             if is_cloud_device():
-                tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
+                # Pass use_alt_group to enable dual-channel communication
+                # for prefill/decode separation in edge-cloud scenarios
+                tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
+                    use_alt_group=use_alt_group,
+                )
                 intermediate_tensors = AsyncIntermediateTensors(
                     tensor_dict,
                     comm_handles=comm_handles,
@@ -565,7 +569,11 @@ class NPUWorker(WorkerBase):
         if is_edge_device():
             if get_pp_group().world_size == 2:
                 self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
-            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
+            # Pass use_alt_group to enable dual-channel communication
+            # for prefill/decode separation in edge-cloud scenarios
+            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
+                use_alt_group=use_alt_group,
+            )
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
                 comm_handles=comm_handles,

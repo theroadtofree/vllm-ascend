@@ -256,6 +256,15 @@ def init_ascend_model_parallel(
         backend = torch.distributed.get_backend(get_world_group().device_group)
         pp_group.create_alternate_groups(backend)
 
+    # Create alternate TP groups for edge-cloud dual-channel communication.
+    # In edge-cloud scenarios, TP broadcast uses alternate groups to avoid
+    # blocking with PP communication. This enables independent prefill/decode
+    # traffic paths through separate communication channels.
+    if parallel_config.enable_edge_cloud and global_tp_size > 1:
+        tp_group = get_tp_group()
+        backend = torch.distributed.get_backend(get_world_group().device_group)
+        tp_group.create_alternate_groups(backend)
+
 
 def model_parallel_initialized():
     return _MC2 is not None
@@ -372,25 +381,64 @@ def destroy_ascend_model_parallel():
     _DYNAMIC_EPLB = None
 
 
-def edge_cloud_broadcast_recv() -> tuple[
+def edge_cloud_broadcast_recv(
+    use_alt_group: bool = False,
+) -> tuple[
     dict[str, torch.Tensor | Any] | None,
     list[Handle],
     list[Callable[[], None]],
 ]:
-    """Receive PP tensors and broadcast them within the local edge/cloud TP group."""
+    """Receive PP tensors and broadcast them within the local edge/cloud TP group.
+    
+    Args:
+        use_alt_group: If True, use alternate communication groups for both
+            PP receive and TP broadcast. This enables dual-channel communication
+            where prefill and decode steps can use different communication paths,
+            avoiding mutual blocking.
+    
+    Returns:
+        A tuple of (tensor_dict, comm_handles, comm_postprocess) where:
+        - tensor_dict: Received tensor dictionary
+        - comm_handles: List of communication handles for async operations
+        - comm_postprocess: List of postprocessing functions to be called
+    """
     pp_group = get_pp_group()
     tp_group = get_tp_group()
     is_pp_npu0 = pp_group.world_size == 2
 
     if is_pp_npu0:
-        tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict()
+        # Edge-cloud mode: receive from PP and broadcast within TP
+        tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict(
+            use_alt_group=use_alt_group,
+        )
         assert tensor_dict is not None, (
             "edge_cloud_broadcast_recv: PP tensor_dict is None, "
             "sender may have failed."
         )
 
         metadata_list, _ = _split_tensor_dict(tensor_dict)
-        tp_group.broadcast_object(metadata_list, src=0)
+        # Broadcast metadata using the appropriate CPU group
+        # Note: broadcast_object doesn't support use_alt_group, so we implement it manually
+        if use_alt_group:
+            assert tp_group.alt_cpu_group is not None, (
+                "Alternate CPU group not created. Call create_alternate_groups() first."
+            )
+            if tp_group.rank_in_group == 0:
+                torch.distributed.broadcast_object_list(
+                    [metadata_list],
+                    src=tp_group.ranks[0],
+                    group=tp_group.alt_cpu_group,
+                )
+            else:
+                recv = [None]
+                torch.distributed.broadcast_object_list(
+                    recv,
+                    src=tp_group.ranks[0],
+                    group=tp_group.alt_cpu_group,
+                )
+                metadata_list = recv[0]
+        else:
+            tp_group.broadcast_object(metadata_list, src=0)
 
         def broadcast_postprocess():
             _, tensor_list = _split_tensor_dict(tensor_dict) if tensor_dict else (None, [])
@@ -398,7 +446,14 @@ def edge_cloud_broadcast_recv() -> tuple[
             for tensor in tensor_list:
                 if tensor.numel() == 0:
                     continue
-                group = tp_group.cpu_group if tensor.is_cpu else tp_group.device_group
+                # Select communication group based on use_alt_group flag
+                if use_alt_group:
+                    assert tp_group.alt_cpu_group is not None and tp_group.alt_device_group is not None, (
+                        "Alternate groups not created. Call create_alternate_groups() first."
+                    )
+                    group = tp_group.alt_cpu_group if tensor.is_cpu else tp_group.alt_device_group
+                else:
+                    group = tp_group.cpu_group if tensor.is_cpu else tp_group.device_group
                 handles.append(
                     torch.distributed.broadcast(
                         tensor, src=tp_group.ranks[0], group=group, async_op=True
@@ -410,7 +465,28 @@ def edge_cloud_broadcast_recv() -> tuple[
         comm_postprocess.append(broadcast_postprocess)
         return tensor_dict, comm_handles, comm_postprocess
 
-    metadata_list = tp_group.broadcast_object(None, src=0)
+    # Non-edge-cloud mode: broadcast within TP group
+    # Use alternate groups if requested
+    if use_alt_group:
+        assert tp_group.alt_cpu_group is not None and tp_group.alt_device_group is not None, (
+            "Alternate groups not created. Call create_alternate_groups() first."
+        )
+    
+    # Note: broadcast_object doesn't support use_alt_group, so we implement it manually
+    if use_alt_group:
+        if tp_group.rank_in_group == 0:
+            metadata_list = None
+        else:
+            recv = [None]
+            torch.distributed.broadcast_object_list(
+                recv,
+                src=tp_group.ranks[0],
+                group=tp_group.alt_cpu_group,
+            )
+            metadata_list = recv[0]
+    else:
+        metadata_list = tp_group.broadcast_object(None, src=0)
+    
     if metadata_list is None:
         metadata_list = []
     recv_tensor_dict: dict[str, torch.Tensor | Any] = {}
@@ -427,7 +503,14 @@ def edge_cloud_broadcast_recv() -> tuple[
         for tensor in recv_tensor_dict.values():
             if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
                 continue
-            group = tp_group.cpu_group if tensor.is_cpu else tp_group.device_group
+            # Select communication group based on use_alt_group flag
+            if use_alt_group:
+                assert tp_group.alt_cpu_group is not None and tp_group.alt_device_group is not None, (
+                    "Alternate groups not created. Call create_alternate_groups() first."
+                )
+                group = tp_group.alt_cpu_group if tensor.is_cpu else tp_group.alt_device_group
+            else:
+                group = tp_group.cpu_group if tensor.is_cpu else tp_group.device_group
             handles.append(
                 torch.distributed.broadcast(
                     tensor, src=tp_group.ranks[0], group=group, async_op=True
