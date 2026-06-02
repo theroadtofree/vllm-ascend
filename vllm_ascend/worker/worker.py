@@ -17,6 +17,8 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_worker.py
 #
 
+from enum import Enum
+from typing import Any
 import copy
 import gc
 import logging
@@ -73,6 +75,13 @@ from vllm_ascend.utils import (
     vllm_version_is,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+class SchedulerBatchType(Enum):
+    """Enum for the batch type of a SchedulerOutput step."""
+    ALL_PREFILL = "ALL_PREFILL"
+    ALL_DECODE = "ALL_DECODE"
+    PREFILL_DECODE_MIXED = "PREFILL_DECODE_MIXED"
+
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
@@ -424,10 +433,71 @@ class NPUWorker(WorkerBase):
 
         return int(self.available_kv_cache_memory_bytes)
 
+    @staticmethod
+    def _get_scheduler_batch_type(
+        scheduler_output: "SchedulerOutput",
+    ) -> SchedulerBatchType | None:
+        """Determine whether the scheduler output is all prefill,
+        all decode, or mixed. Returns None if no tokens are scheduled."""
+        if scheduler_output.total_num_scheduled_tokens == 0:
+            return None
+
+        num_prefill_reqs = 0
+        num_prefill_tokens = 0
+        num_decode_reqs = 0
+        num_decode_tokens = 0
+
+        # New requests are always in prefill phase.
+        for new_req in scheduler_output.scheduled_new_reqs:
+            req_id = new_req.req_id
+            token_count = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            num_prefill_reqs += 1
+            num_prefill_tokens += token_count
+
+        # Cached requests: use is_context_phase to distinguish
+        # prefill (num_output_tokens == 0) from decode.
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        for req_id in cached_reqs.req_ids:
+            token_count = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            if cached_reqs.is_context_phase(req_id):
+                num_prefill_reqs += 1
+                num_prefill_tokens += token_count
+            else:
+                num_decode_reqs += 1
+                num_decode_tokens += token_count
+
+        if num_decode_reqs == 0:
+            batch_type = SchedulerBatchType.ALL_PREFILL
+        elif num_prefill_reqs == 0:
+            batch_type = SchedulerBatchType.ALL_DECODE
+        else:
+            batch_type = SchedulerBatchType.PREFILL_DECODE_MIXED
+
+        logger.info(
+            "SchedulerOutput batch type: %s | "
+            "prefill_reqs=%d, prefill_tokens=%d | "
+            "decode_reqs=%d, decode_tokens=%d | "
+            "total_tokens=%d",
+            batch_type.value,
+            num_prefill_reqs,
+            num_prefill_tokens,
+            num_decode_reqs,
+            num_decode_tokens,
+            scheduler_output.total_num_scheduled_tokens,
+        )
+        return batch_type
+
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
+        layer_slice_info: Any = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        batch_type = self._get_scheduler_batch_type(scheduler_output)
+        # Route ALL_DECODE steps through the alternate PP communication
+        # groups, and non-ALL_DECODE steps through the primary PP
+        # communication groups.
+        use_alt_group = (batch_type == SchedulerBatchType.ALL_DECODE)
+
         # enable msMonitor to monitor the performance of vllm-ascend
         if envs_ascend.MSMONITOR_USE_DAEMON:
             dp.step()
@@ -436,6 +506,11 @@ class NPUWorker(WorkerBase):
             for handle in self._pp_send_work:
                 handle.wait()
             self._pp_send_work = []
+
+        # Only receive intermediate tensors on the first slice.
+        is_first_slice = (
+            layer_slice_info is None or layer_slice_info.is_first_slice
+        )
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
@@ -447,7 +522,7 @@ class NPUWorker(WorkerBase):
                     comm_handles=comm_handles,
                     comm_postprocess=comm_postprocess,
                 )
-            elif not get_pp_group().is_first_rank:
+            elif not get_pp_group().is_first_rank and is_first_slice:
                 # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
                 # it will conflict with the all-gather operation in flashcomm1.
                 if enable_sp():
@@ -455,7 +530,8 @@ class NPUWorker(WorkerBase):
                 else:
                     all_gather_group = get_tp_group()
                 tensor_dict, comm_handles, comm_postprocess = get_pp_group().irecv_tensor_dict(
-                    all_gather_group=all_gather_group
+                    all_gather_group=all_gather_group,
+                    use_alt_group=use_alt_group,
                 )
                 assert tensor_dict is not None, (
                     "worker irecv_tensor_dict returned None, "
@@ -470,7 +546,17 @@ class NPUWorker(WorkerBase):
         if self.profiler is not None:
             self.profiler.step()
 
-        output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        output = self.model_runner.execute_model(scheduler_output, intermediate_tensors,
+                                                 layer_slice_info=layer_slice_info)
+
+        # For non-last slices, the model_runner saves intermediate state
+        # and returns None — skip PP send and return immediately.
+        is_last_slice = (
+            layer_slice_info is None or layer_slice_info.is_last_slice
+        )
+        if not is_last_slice:
+            return None
+
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 
@@ -504,6 +590,7 @@ class NPUWorker(WorkerBase):
             self._pp_send_work = get_pp_group().isend_tensor_dict(
                 output.tensors,
                 all_gather_group=all_gather_group,
+                use_alt_group=use_alt_group,
             )
 
         kv_connector_output = output.kv_connector_output

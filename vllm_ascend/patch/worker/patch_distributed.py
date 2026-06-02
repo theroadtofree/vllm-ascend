@@ -113,6 +113,12 @@ class GroupCoordinatorPatch(GroupCoordinator):
 
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
+        # Store all group_ranks so that create_alternate_groups can
+        # iterate over every subgroup — torch.distributed.new_group
+        # is a collective on the default group and must be called by
+        # every rank, even for subgroups it does not belong to.
+        self._all_group_ranks = group_ranks
+
         self.backend = _normalize_backend(torch_distributed_backend)
         self._acquired_hccl_keys = []
         self._unshared_hccl_groups = []
@@ -153,6 +159,13 @@ class GroupCoordinatorPatch(GroupCoordinator):
 
             assert self.cpu_group is not None
             assert self.device_group is not None
+
+            # Alternate device/cpu groups for dual-channel PP communication.
+            # When set, these provide a second independent communication channel
+            # over the same ranks. Used in PP to separate decode from
+            # non-decode traffic.
+            self.alt_device_group: torch.distributed.ProcessGroup | None = None
+            self.alt_cpu_group: torch.distributed.ProcessGroup | None = None
 
             self.device = torch.npu.current_device()
             if use_device_communicator and self.world_size > 1:
@@ -208,6 +221,45 @@ class GroupCoordinatorPatch(GroupCoordinator):
 
         if getattr(self, "mq_broadcaster", None) is not None:
             self.mq_broadcaster = None
+
+    def create_alternate_groups(
+        self,
+        torch_distributed_backend: str | Backend,
+    ) -> None:
+        """Create alternate device and cpu groups over the same ranks.
+
+        Must be called collectively by all ranks in the **default** group
+        (i.e. every rank that participates in ``torch.distributed``), because
+        ``torch.distributed.new_group`` is a collective operation on the
+        default group. After calling this, communication methods can use
+        ``use_alt_group=True`` to route through the alternate
+        communication channel.
+        """
+        assert self.alt_device_group is None, (
+            "Alternate groups already created"
+        )
+        hccl_pg_options = create_hccl_pg_options("pp_alt")
+        self_alt_device_group = None
+        self_alt_cpu_group = None
+        # Iterate over ALL subgroups so that every rank participates in
+        # every new_group call (required because new_group is collective
+        # on the default group).  Only save the group this rank belongs to.
+        for ranks in self._all_group_ranks:
+            alt_device_group = torch.distributed.new_group(
+                ranks,
+                backend=torch_distributed_backend,
+                pg_options=hccl_pg_options,
+            )
+            alt_cpu_group = torch.distributed.new_group(
+                ranks, backend="gloo"
+            )
+            if self.rank in ranks:
+                self_alt_device_group = alt_device_group
+                self_alt_cpu_group = alt_cpu_group
+        assert self_alt_device_group is not None
+        assert self_alt_cpu_group is not None
+        self.alt_device_group = self_alt_device_group
+        self.alt_cpu_group = self_alt_cpu_group
 
     def all_to_all(
         self,
