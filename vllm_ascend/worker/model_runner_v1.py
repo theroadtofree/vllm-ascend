@@ -18,6 +18,7 @@
 #
 
 import math
+from vllm import envs
 import sys
 import time
 from collections import defaultdict
