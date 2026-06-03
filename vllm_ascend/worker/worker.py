@@ -63,6 +63,7 @@ from vllm_ascend.distributed.parallel_state import (
     get_channel_from_step_id,
     init_ascend_model_parallel,
 )
+from vllm.v1.core.sched.output import BatchType
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (
@@ -489,6 +490,13 @@ class NPUWorker(WorkerBase):
                 self._pp_send_work[channel] = get_pp_group().isend_tensor_dict(
                     output.tensors, channel=channel
                 )
+
+            # ── Edge-cloud async (Phase 2): batch_first only executes head ──
+            if scheduler_output.batch_type == BatchType.FIRST:
+                from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
+                return EMPTY_MODEL_RUNNER_OUTPUT
+
+            # batch_last or FULL: wait for cloud return and execute tail
             tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
                 channel=channel
             )

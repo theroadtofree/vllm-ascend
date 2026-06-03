@@ -2642,11 +2642,17 @@ class NPUModelRunner(GPUModelRunner):
         }
         if self._edge_cloud_enabled:
             if self.edge_cloud_cfg.role == "edge":
-                segment = (
-                    self.segment_a_wrapper
-                    if intermediate_tensors is None
-                    else self.segment_e_wrapper
-                )
+                # ── Edge-cloud async (Phase 2): batch_type drives segment selection ──
+                if scheduler_output.batch_type == BatchType.FIRST:
+                    segment = self.segment_a_wrapper
+                elif scheduler_output.batch_type == BatchType.LAST:
+                    segment = self.segment_e_wrapper
+                else:
+                    segment = (
+                        self.segment_a_wrapper
+                        if intermediate_tensors is None
+                        else self.segment_e_wrapper
+                    )
             else:
                 segment = self.segment_c_wrapper
             run_model = partial(segment, **model_inputs)
