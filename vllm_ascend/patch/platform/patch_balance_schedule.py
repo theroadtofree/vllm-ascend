@@ -586,7 +586,9 @@ class BalanceScheduler(Scheduler):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            step_id=self._step_id,
         )
+        self._step_id += 1
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
