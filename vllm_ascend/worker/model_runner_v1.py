@@ -1796,7 +1796,11 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        logger.info("SchedulerOutput step_id: %d", scheduler_output.step_id)
+        logger.info(
+            "SchedulerOutput step_id: %d, channel: %d",
+            scheduler_output.step_id,
+            scheduler_output.step_id % 2,
+        )
         if self.vllm_config.model_config.enable_return_routed_experts:
             if vllm_version_is("0.20.2"):
                 capturer = RoutedExpertsCapturer.get_instance()

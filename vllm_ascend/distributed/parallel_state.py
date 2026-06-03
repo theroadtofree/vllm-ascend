@@ -359,18 +359,26 @@ def destroy_ascend_model_parallel():
     _DYNAMIC_EPLB = None
 
 
-def edge_cloud_broadcast_recv() -> tuple[
+def edge_cloud_broadcast_recv(channel: int = 0) -> tuple[
     dict[str, torch.Tensor | Any] | None,
     list[Handle],
     list[Callable[[], None]],
 ]:
-    """Receive PP tensors and broadcast them within the local edge/cloud TP group."""
+    """Receive PP tensors and broadcast them within the local edge/cloud TP group.
+
+    Args:
+        channel: Communication channel index (0 or 1) for dual-channel transfer.
+            channel=0 uses the primary cpu_group/device_group,
+            channel=1 uses the alternate alt_cpu_group/alt_device_group.
+    """
     pp_group = get_pp_group()
     tp_group = get_tp_group()
     is_pp_npu0 = pp_group.world_size == 2
 
     if is_pp_npu0:
-        tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict()
+        tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict(
+            channel=channel
+        )
         assert tensor_dict is not None, (
             "edge_cloud_broadcast_recv: PP tensor_dict is None, "
             "sender may have failed."
@@ -424,3 +432,8 @@ def edge_cloud_broadcast_recv() -> tuple[
             handle.wait()
 
     return recv_tensor_dict, [], [broadcast_postprocess]
+
+
+def get_channel_from_step_id(step_id: int) -> int:
+    """Map step_id to a communication channel (0 or 1) based on parity."""
+    return step_id % 2

@@ -60,6 +60,7 @@ from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import (
     edge_cloud_broadcast_recv,
+    get_channel_from_step_id,
     init_ascend_model_parallel,
 )
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
@@ -150,7 +151,7 @@ class NPUWorker(WorkerBase):
         if self.use_v2_model_runner and vllm_version_is("0.20.2"):
             logger.warning("VLLM_USE_V2_MODEL_RUNNER is not supported on vllm 0.20.2; falling back to v1 model runner.")
             self.use_v2_model_runner = False
-        self._pp_send_work: list[Handle] = []
+        self._pp_send_work: list[list[Handle]] = [[], []]  # channel 0, channel 1
 
         ascend_compilation_config = get_ascend_config().ascend_compilation_config
         if ascend_compilation_config.enable_npugraph_ex and ascend_compilation_config.enable_static_kernel:
@@ -432,16 +433,23 @@ class NPUWorker(WorkerBase):
         if envs_ascend.MSMONITOR_USE_DAEMON:
             dp.step()
 
-        if self._pp_send_work:
-            for handle in self._pp_send_work:
+        step_id = scheduler_output.step_id
+        channel = get_channel_from_step_id(step_id)
+
+        # Wait for the previous transfer on the SAME channel to complete.
+        # This enables overlap: the OTHER channel's transfer can still be in flight.
+        if self._pp_send_work[channel]:
+            for handle in self._pp_send_work[channel]:
                 handle.wait()
-            self._pp_send_work = []
+            self._pp_send_work[channel] = []
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass:
             if is_cloud_device():
-                tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
+                tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
+                    channel=channel
+                )
                 intermediate_tensors = AsyncIntermediateTensors(
                     tensor_dict,
                     comm_handles=comm_handles,
@@ -478,8 +486,12 @@ class NPUWorker(WorkerBase):
         parallel_config = self.vllm_config.parallel_config
         if is_edge_device():
             if get_pp_group().world_size == 2:
-                self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
-            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
+                self._pp_send_work[channel] = get_pp_group().isend_tensor_dict(
+                    output.tensors, channel=channel
+                )
+            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
+                channel=channel
+            )
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
                 comm_handles=comm_handles,
@@ -492,7 +504,9 @@ class NPUWorker(WorkerBase):
 
         if is_cloud_device():
             if get_pp_group().world_size == 2:
-                self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
+                self._pp_send_work[channel] = get_pp_group().isend_tensor_dict(
+                    output.tensors, channel=channel
+                )
         else:
             assert parallel_config.distributed_executor_backend != ("external_launcher") and not get_pp_group().is_last_rank
             # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
@@ -501,7 +515,7 @@ class NPUWorker(WorkerBase):
                 all_gather_group = None
             else:
                 all_gather_group = get_tp_group()
-            self._pp_send_work = get_pp_group().isend_tensor_dict(
+            self._pp_send_work[channel] = get_pp_group().isend_tensor_dict(
                 output.tensors,
                 all_gather_group=all_gather_group,
             )
