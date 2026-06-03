@@ -771,7 +771,9 @@ class RecomputeScheduler(Scheduler):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
             recomputed_reqs=recomputed_reqs,
+            step_id=self._step_id,
         )
+        self._step_id += 1
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
