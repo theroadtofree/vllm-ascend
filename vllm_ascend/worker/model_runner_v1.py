@@ -66,7 +66,7 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import ECExecPhase, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -2125,12 +2125,19 @@ class NPUModelRunner(GPUModelRunner):
 
             if not self.broadcast_pp_output:
                 # Common case.
-                if self._edge_cloud_enabled and isinstance(
-                    hidden_states, IntermediateTensors
-                ):
-                    # Edge-cloud head segment always returns IntermediateTensors,
-                    # regardless of is_last_rank, so the worker can send them to
-                    # the cloud side and receive results back for the tail segment.
+                # Edge-cloud split inference: only return IntermediateTensors
+                # for FIRST_LAYERS phase on edge device. LAST_LAYERS phase
+                # should fall through to sampling (producing final output).
+                ec_is_first_layer_step = (
+                    self._edge_cloud_enabled
+                    and isinstance(hidden_states, IntermediateTensors)
+                    and scheduler_output.ec_exec_phase == ECExecPhase.FIRST_LAYERS
+                )
+                if ec_is_first_layer_step:
+                    # Edge-cloud head segment returns IntermediateTensors,
+                    # regardless of is_last_rank, so the worker can send them
+                    # to the cloud side and receive results back for the tail
+                    # segment.
                     # For embedding_only edge, the output tensors have actual
                     # batch size (no cudagraph padding on edge), but cloud's
                     # pre-allocated buffer is sized to max_num_tokens. Pad here
