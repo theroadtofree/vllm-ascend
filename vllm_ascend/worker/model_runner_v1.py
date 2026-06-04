@@ -66,7 +66,7 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import SchedulerOutput, BatchType
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -2107,7 +2107,7 @@ class NPUModelRunner(GPUModelRunner):
             ) as kv_connector_output,
         ):
             hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, batch_type=scheduler_output.batch_type,**model_kwargs
             )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
@@ -2627,6 +2627,7 @@ class NPUModelRunner(GPUModelRunner):
         positions: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        batch_type: BatchType = BatchType.FULL,
         **model_kwargs: dict[str, Any],
     ):
         assert self.model is not None
@@ -2643,9 +2644,9 @@ class NPUModelRunner(GPUModelRunner):
         if self._edge_cloud_enabled:
             if self.edge_cloud_cfg.role == "edge":
                 # ── Edge-cloud async (Phase 2): batch_type drives segment selection ──
-                if scheduler_output.batch_type == BatchType.FIRST:
+                if batch_type == BatchType.FIRST:
                     segment = self.segment_a_wrapper
-                elif scheduler_output.batch_type == BatchType.LAST:
+                elif batch_type == BatchType.LAST:
                     segment = self.segment_e_wrapper
                 else:
                     segment = (
