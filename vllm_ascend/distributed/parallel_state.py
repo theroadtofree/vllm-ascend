@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch
@@ -12,6 +13,8 @@ from vllm.distributed.parallel_state import (
     get_world_group,
     init_model_parallel_group,
 )
+from vllm.logger import logger
+from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.utils import enable_dsa_cp_with_layer_shard, flashcomm2_enable
@@ -36,6 +39,76 @@ _SHARD_WEIGHT: GroupCoordinator | None = None
 _P_TP: GroupCoordinator | None = None
 
 _DYNAMIC_EPLB: GroupCoordinator | None = None
+
+# Edge-cloud pre-computed tensor metadata cache
+_EDGE_CLOUD_TENSOR_META: "EdgeCloudTensorMeta | None" = None
+
+
+@dataclass
+class EdgeCloudTensorMeta:
+    """Pre-computed tensor metadata for edge-cloud hidden state transfer.
+
+    Avoids sending metadata via send_object/recv_object (pickle+Gloo) by
+    computing it locally on both sides from config + SchedulerOutput.
+    """
+    # List of (key, TensorMetadata) pairs, matching the output of _split_tensor_dict
+    metadata_list: list[tuple[str, Any]]
+    # Ordered list of tensor keys (same order as metadata_list, only tensor entries)
+    tensor_keys: list[str]
+
+
+def init_edge_cloud_tensor_meta(
+    hidden_size: int,
+    hidden_dtype: str = "bf16",
+    has_residual: bool = True,
+):
+    """Initialize the pre-computed tensor metadata for edge-cloud transfers.
+
+    Called once during worker initialization. The metadata is used by
+    edge_cloud_irecv_tensor_dict to allocate receive buffers without
+    requiring an inter-node metadata exchange.
+
+    Args:
+        hidden_size: model hidden dimension (from hf_text_config.hidden_size)
+        hidden_dtype: dtype string from EdgeCloudConfig, e.g. "bf16"
+        has_residual: dynamically detected — True if the model produces a
+            residual tensor in IntermediateTensors (most decoder models do).
+    """
+    global _EDGE_CLOUD_TENSOR_META
+
+    dtype = STR_DTYPE_TO_TORCH_DTYPE[hidden_dtype]
+    device = "npu"
+
+    metadata_list: list[tuple[str, Any]] = [
+        ("hidden_states", TensorMetadata(device, dtype, (0, hidden_size))),
+    ]
+    tensor_keys = ["hidden_states"]
+
+    if has_residual:
+        metadata_list.append(
+            ("residual", TensorMetadata(device, dtype, (0, hidden_size)))
+        )
+        tensor_keys.append("residual")
+
+    _EDGE_CLOUD_TENSOR_META = EdgeCloudTensorMeta(
+        metadata_list=metadata_list,
+        tensor_keys=tensor_keys,
+    )
+    logger.info(
+        "[EdgeCloud] Initialized tensor meta: keys=%s, dtype=%s, hidden_size=%d",
+        tensor_keys,
+        hidden_dtype,
+        hidden_size,
+    )
+
+
+def get_edge_cloud_tensor_meta() -> EdgeCloudTensorMeta:
+    """Get the pre-computed edge-cloud tensor metadata."""
+    assert _EDGE_CLOUD_TENSOR_META is not None, (
+        "Edge-cloud tensor meta not initialized. "
+        "Call init_edge_cloud_tensor_meta() first."
+    )
+    return _EDGE_CLOUD_TENSOR_META
 
 
 def init_ascend_model_parallel(
@@ -359,25 +432,130 @@ def destroy_ascend_model_parallel():
     _DYNAMIC_EPLB = None
 
 
-def edge_cloud_broadcast_recv() -> tuple[
+def edge_cloud_isend_tensor_dict(
+    tensor_dict: dict[str, torch.Tensor | Any],
+    dst: int | None = None,
+) -> list[Handle]:
+    """Send tensor dict without metadata sync (edge-cloud optimized).
+
+    Skips send_object(metadata_list) — the receiver already knows the
+    tensor structure from init_edge_cloud_tensor_meta() and computes
+    shapes locally from SchedulerOutput.total_num_scheduled_tokens.
+
+    This eliminates the inter-node pickle+Gloo metadata exchange that
+    the standard GroupCoordinator.isend_tensor_dict performs.
+    """
+    pp_group = get_pp_group()
+    if pp_group.world_size <= 1:
+        return []
+
+    if dst is None:
+        dst = (pp_group.rank_in_group + 1) % pp_group.world_size
+
+    group = pp_group.device_group
+
+    handles: list[Handle] = []
+    for key, value in tensor_dict.items():
+        if not isinstance(value, torch.Tensor):
+            continue
+        if value.numel() == 0:
+            continue
+        handle = torch.distributed.isend(
+            value, dst=pp_group.ranks[dst], group=group
+        )
+        if value.is_cuda:
+            value.record_stream(torch.cuda.current_stream(value.device))
+        handles.append(handle)
+
+    return handles
+
+
+def edge_cloud_irecv_tensor_dict(
+    num_tokens: int,
+    src: int | None = None,
+) -> tuple[dict[str, torch.Tensor | Any], list[Handle], list[Callable[[], None]]]:
+    """Receive tensor dict without metadata sync (edge-cloud optimized).
+
+    Computes metadata locally from num_tokens + the pre-computed
+    EdgeCloudTensorMeta, pre-allocates tensors, then issues irecv
+    for each. This eliminates the inter-node pickle+Gloo metadata
+    exchange that the standard GroupCoordinator.irecv_tensor_dict
+    performs.
+
+    Args:
+        num_tokens: total_num_scheduled_tokens from SchedulerOutput
+        src: source rank in PP group (default: previous rank)
+    """
+    pp_group = get_pp_group()
+    if not torch.distributed.is_initialized() or pp_group.world_size == 1:
+        return {}, [], []
+
+    if src is None:
+        src = (pp_group.rank_in_group - 1) % pp_group.world_size
+
+    ec_meta = get_edge_cloud_tensor_meta()
+    group = pp_group.device_group
+
+    tensor_dict: dict[str, Any] = {}
+    handles: list[Handle] = []
+    postprocess: list[Callable[[], None]] = []
+
+    for key, value in ec_meta.metadata_list:
+        if isinstance(value, TensorMetadata):
+            # Replace the placeholder dim-0 with actual num_tokens
+            actual_size = (num_tokens,) + value.size[1:]
+            full_tensor = torch.empty(
+                actual_size, dtype=value.dtype, device=value.device
+            )
+
+            if full_tensor.numel() == 0:
+                tensor_dict[key] = full_tensor
+                continue
+
+            handle = torch.distributed.irecv(
+                full_tensor, src=pp_group.ranks[src], group=group
+            )
+            handles.append(handle)
+            tensor_dict[key] = full_tensor
+        else:
+            tensor_dict[key] = value
+
+    return tensor_dict, handles, postprocess
+
+
+def edge_cloud_broadcast_recv(
+    num_tokens: int,
+) -> tuple[
     dict[str, torch.Tensor | Any] | None,
     list[Handle],
     list[Callable[[], None]],
 ]:
-    """Receive PP tensors and broadcast them within the local edge/cloud TP group."""
+    """Receive PP tensors and broadcast within the local edge/cloud TP group.
+
+    Uses locally computed metadata instead of receiving it from the sender.
+    This eliminates the inter-node pickle+Gloo metadata exchange, while
+    still broadcasting metadata within the local TP group (intra-node)
+    so that non-NPU0 TP ranks can allocate tensors.
+    """
     pp_group = get_pp_group()
     tp_group = get_tp_group()
     is_pp_npu0 = pp_group.world_size == 2
+    ec_meta = get_edge_cloud_tensor_meta()
 
     if is_pp_npu0:
-        tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict()
+        # PP rank 0: receive tensor data from the other side (edge/cloud)
+        # without metadata sync — shapes are computed locally
+        tensor_dict, comm_handles, comm_postprocess = edge_cloud_irecv_tensor_dict(
+            num_tokens=num_tokens,
+        )
         assert tensor_dict is not None, (
-            "edge_cloud_broadcast_recv: PP tensor_dict is None, "
-            "sender may have failed."
+            "edge_cloud_broadcast_recv: tensor_dict is None, sender may have failed."
         )
 
-        metadata_list, _ = _split_tensor_dict(tensor_dict)
-        tp_group.broadcast_object(metadata_list, src=0)
+        # Broadcast locally-computed metadata + num_tokens to other TP ranks
+        # so they can allocate tensors (this is intra-node, fast)
+        metadata_list = ec_meta.metadata_list
+        tp_group.broadcast_object([num_tokens, metadata_list], src=0)
 
         def broadcast_postprocess():
             _, tensor_list = _split_tensor_dict(tensor_dict) if tensor_dict else (None, [])
@@ -397,14 +575,21 @@ def edge_cloud_broadcast_recv() -> tuple[
         comm_postprocess.append(broadcast_postprocess)
         return tensor_dict, comm_handles, comm_postprocess
 
-    metadata_list = tp_group.broadcast_object(None, src=0)
+    # Non-PP-NPU0 ranks: receive metadata from NPU 0 via TP broadcast,
+    # allocate tensors, then broadcast-recv actual data
+    broadcast_data = tp_group.broadcast_object(None, src=0)
+    recv_num_tokens = broadcast_data[0]
+    metadata_list = broadcast_data[1]
     if metadata_list is None:
         metadata_list = []
+
     recv_tensor_dict: dict[str, torch.Tensor | Any] = {}
 
     for key, value in metadata_list:
         if isinstance(value, TensorMetadata):
-            tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+            # Replace placeholder dim-0 with actual num_tokens
+            actual_size = (recv_num_tokens,) + value.size[1:]
+            tensor = torch.empty(actual_size, dtype=value.dtype, device=value.device)
             recv_tensor_dict[key] = tensor
         else:
             recv_tensor_dict[key] = value
