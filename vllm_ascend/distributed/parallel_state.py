@@ -76,7 +76,11 @@ def init_edge_cloud_tensor_meta(
     """
     global _EDGE_CLOUD_TENSOR_META
 
-    dtype = STR_DTYPE_TO_TORCH_DTYPE[hidden_dtype]
+    # Normalize shorthand dtype aliases to the canonical keys used by
+    # STR_DTYPE_TO_TORCH_DTYPE (e.g. "bf16" -> "bfloat16").
+    _DTYPE_ALIASES = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}
+    canonical_dtype = _DTYPE_ALIASES.get(hidden_dtype, hidden_dtype)
+    dtype = STR_DTYPE_TO_TORCH_DTYPE[canonical_dtype]
     device = "npu"
 
     metadata_list: list[tuple[str, Any]] = [
