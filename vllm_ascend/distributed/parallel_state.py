@@ -14,7 +14,6 @@ from vllm.distributed.parallel_state import (
     init_model_parallel_group,
 )
 from vllm.logger import logger
-from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.utils import enable_dsa_cp_with_layer_shard, flashcomm2_enable
@@ -59,7 +58,7 @@ class EdgeCloudTensorMeta:
 
 def init_edge_cloud_tensor_meta(
     hidden_size: int,
-    hidden_dtype: str = "bf16",
+    hidden_dtype: torch.dtype = torch.bfloat16,
     has_residual: bool = True,
 ):
     """Initialize the pre-computed tensor metadata for edge-cloud transfers.
@@ -70,17 +69,15 @@ def init_edge_cloud_tensor_meta(
 
     Args:
         hidden_size: model hidden dimension (from hf_text_config.hidden_size)
-        hidden_dtype: dtype string from EdgeCloudConfig, e.g. "bf16"
+        hidden_dtype: torch.dtype derived directly from model_config.dtype
+            (equivalent to MindIE's config.torch_dtype from config.json),
+            eliminating the need for a separate user-configured dtype string.
         has_residual: dynamically detected — True if the model produces a
             residual tensor in IntermediateTensors (most decoder models do).
     """
     global _EDGE_CLOUD_TENSOR_META
 
-    # Normalize shorthand dtype aliases to the canonical keys used by
-    # STR_DTYPE_TO_TORCH_DTYPE (e.g. "bf16" -> "bfloat16").
-    _DTYPE_ALIASES = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}
-    canonical_dtype = _DTYPE_ALIASES.get(hidden_dtype, hidden_dtype)
-    dtype = STR_DTYPE_TO_TORCH_DTYPE[canonical_dtype]
+    dtype = hidden_dtype
     device = "npu"
 
     metadata_list: list[tuple[str, Any]] = [
@@ -101,7 +98,7 @@ def init_edge_cloud_tensor_meta(
     logger.info(
         "[EdgeCloud] Initialized tensor meta: keys=%s, dtype=%s, hidden_size=%d",
         tensor_keys,
-        hidden_dtype,
+        dtype,
         hidden_size,
     )
 

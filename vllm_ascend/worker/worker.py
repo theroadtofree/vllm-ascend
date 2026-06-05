@@ -360,7 +360,12 @@ class NPUWorker(WorkerBase):
         # (skips inter-node metadata sync in irecv_tensor_dict/isend_tensor_dict)
         if getattr(self.model_runner, '_edge_cloud_enabled', False):
             hidden_size = self.model_config.hf_text_config.hidden_size
-            hidden_dtype = self.model_runner.edge_cloud_cfg.hidden_dtype
+            # Derive dtype directly from model config (same as MindIE's
+            # self.config.torch_dtype from config.json), instead of
+            # requiring a separate user-configured hidden_dtype.
+            # model_config.dtype is a torch.dtype resolved from the
+            # model's config.json torch_dtype field by _get_and_verify_dtype().
+            hidden_dtype = self.model_config.dtype
             has_residual = _detect_has_residual(self.model_config)
             init_edge_cloud_tensor_meta(
                 hidden_size=hidden_size,
