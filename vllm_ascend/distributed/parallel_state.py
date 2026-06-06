@@ -459,19 +459,19 @@ def edge_cloud_send_metadata(
     list and starts ``irecv`` immediately, so ``edge_cloud_isend_tensors``
     afterwards carries no metadata overhead.
 
-    This call is fire-and-forget on the PP rank0 sender. TP ranks > 0 do
-    nothing (the TP-side broadcast is folded into the tensor receive path).
+    Only the PP boundary rank (the one whose ``pp_group.world_size == 2``,
+    i.e. global rank 0 on edge or rank ``edge_npu_count`` on cloud — the
+    same rank that ``isend_tensor_dict`` would have used) actually puts the
+    payload on the wire; every other rank is a no-op. The TP-side fan-out
+    is the receiver's responsibility (see ``edge_cloud_recv_metadata``).
     """
     pp_group = get_pp_group()
-    if pp_group.world_size <= 1:
-        return
-
-    # Only PP rank 0 (the "boundary" rank that owns the cross-domain link)
-    # is responsible for the actual cross-domain metadata send. Other TP ranks
-    # will receive their copy via the TP-internal broadcast that happens
-    # inside ``edge_cloud_recv_metadata`` on the peer side.
-    tp_group = get_tp_group()
-    if tp_group.rank_in_group != 0:
+    # Mirror the original ``edge_cloud_broadcast_recv`` selector: in the
+    # edge-cloud vLLM layout, only the cross-domain pair (edge NPU0,
+    # cloud NPU0) sit in a PP group of size 2. Every other rank gets a
+    # singleton PP group (see vllm/distributed/parallel_state.py:1579-1589),
+    # so ``world_size != 2`` cleanly identifies "no peer to send to".
+    if pp_group.world_size != 2:
         return
 
     if dst is None:
@@ -488,23 +488,35 @@ def edge_cloud_recv_metadata(
     which the caller is expected to allocate or reuse receive buffers and then
     invoke ``edge_cloud_irecv_tensors`` to start the actual tensor transfer.
 
-    On the receiving side, PP rank 0 takes the cross-domain ``recv_object`` and
-    broadcasts the result inside the local TP group; other TP ranks just take
-    the broadcast.
+    Uses the same rank selector as the original
+    ``edge_cloud_broadcast_recv``: only the PP boundary rank actually pulls
+    the cross-domain payload off the wire and then fans it out via the
+    TP-internal ``broadcast_object``. Every other rank on the same side
+    just takes that broadcast.
+
+    This split is critical for correctness — TP is a collective, so all
+    TP ranks MUST enter the broadcast together. Using
+    ``tp_group.rank_in_group == 0`` as the selector would happen to match
+    the PP boundary in the standard layout, but it also makes non-boundary
+    TP ranks skip the broadcast leg entirely, which deadlocks the
+    collective. ``pp_group.world_size == 2`` is the unambiguous signal.
     """
     pp_group = get_pp_group()
     tp_group = get_tp_group()
-    if pp_group.world_size <= 1:
-        return []
 
-    if tp_group.rank_in_group == 0:
+    if pp_group.world_size == 2:
+        # PP boundary: pull the metadata across the WAN, then publish it
+        # locally so non-boundary TP ranks on this side can size their
+        # receive buffers identically.
         if src is None:
             src = (pp_group.rank_in_group - 1) % pp_group.world_size
         metadata_payload = pp_group.recv_object(src=src)
-        # Distribute the metadata across the TP group so every rank can size
-        # its own receive buffer in lockstep.
-        tp_group.broadcast_object(metadata_payload, src=0)
+        if tp_group.world_size > 1:
+            tp_group.broadcast_object(metadata_payload, src=0)
     else:
+        # Non-boundary TP rank: just take the broadcast.
+        if tp_group.world_size <= 1:
+            return []
         metadata_payload = tp_group.broadcast_object(None, src=0)
 
     if metadata_payload is None:
@@ -520,16 +532,13 @@ def edge_cloud_isend_tensors(
 
     Assumes ``edge_cloud_send_metadata`` was already called earlier in the
     step with a payload describing exactly the same tensor keys / dtypes /
-    shapes that appear in ``tensor_dict``. Only the PP rank 0 (TP rank 0)
-    issues the cross-domain ``isend``; other TP ranks return an empty handle
-    list (the receiver fans the tensors out via TP-internal broadcast).
+    shapes that appear in ``tensor_dict``. Only the PP boundary rank
+    (``pp_group.world_size == 2``) puts the tensor on the wire; every other
+    rank is a no-op (the receiver fans the tensors out via TP-internal
+    broadcast in ``edge_cloud_irecv_tensors``).
     """
     pp_group = get_pp_group()
-    if pp_group.world_size <= 1:
-        return []
-
-    tp_group = get_tp_group()
-    if tp_group.rank_in_group != 0:
+    if pp_group.world_size != 2:
         return []
 
     if dst is None:
@@ -574,21 +583,25 @@ def edge_cloud_irecv_tensors(
     broadcast is folded into ``comm_postprocess`` so the receiver behaves the
     same way as the existing ``edge_cloud_broadcast_recv`` (use with
     ``AsyncIntermediateTensors`` for lazy wait).
+
+    ``is_pp_boundary`` is selected via ``pp_group.world_size == 2`` (the
+    same selector ``edge_cloud_broadcast_recv`` uses). Non-boundary TP
+    ranks on the same side allocate matching buffers but skip the
+    cross-domain ``irecv``; they later receive the data through the
+    TP-internal broadcast inside the postprocess callable.
     """
     pp_group = get_pp_group()
     tp_group = get_tp_group()
-    if pp_group.world_size <= 1:
-        return {}, [], []
+    is_pp_boundary = pp_group.world_size == 2
 
-    if src is None:
+    if src is None and is_pp_boundary:
         src = (pp_group.rank_in_group - 1) % pp_group.world_size
 
     tensor_dict: dict[str, torch.Tensor | Any] = {}
     handles: list[Handle] = []
-    is_pp_boundary = tp_group.rank_in_group == 0
 
-    group = pp_group.device_group
-    metadata_group = pp_group.cpu_group
+    group = pp_group.device_group if is_pp_boundary else None
+    metadata_group = pp_group.cpu_group if is_pp_boundary else None
 
     for key, value in metadata_payload:
         if isinstance(value, TensorMetadata):

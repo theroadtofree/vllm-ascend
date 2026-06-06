@@ -6,19 +6,15 @@
 
 The helpers under test split a single ``tensor_dict`` into two cross-WAN
 trips: a small CPU-pickle metadata pre-publish (issued BEFORE
-``_model_forward``) and a payload-only ``isend`` (issued AFTER it). The
-tests verify that:
+``_model_forward``) and a payload-only ``isend`` (issued AFTER it).
 
-* ``edge_cloud_send_metadata`` only fires on PP rank 0 / TP rank 0 and
-  hits ``pp_group.send_object`` (no tensor sends in the call).
-* ``edge_cloud_recv_metadata`` calls ``recv_object`` on the boundary
-  rank and ``broadcast_object`` on TP-internal ranks, returning the
-  metadata list verbatim.
-* ``edge_cloud_isend_tensors`` issues exactly one ``torch.distributed.isend``
-  per non-empty tensor and never touches ``send_object``.
-* ``edge_cloud_irecv_tensors`` invokes ``buffer_provider`` for every
-  ``TensorMetadata`` key (so callers can reuse a pre-allocated buffer)
-  and folds the TP broadcast into the returned postprocess callable.
+Rank-selection invariant under test: in the vllm edge-cloud layout, only
+the cross-domain pair (edge NPU0, cloud NPU0) sits in a PP group of size
+2; every other rank gets a singleton PP group. So ``pp_group.world_size
+== 2`` is the unambiguous "I am the PP boundary" selector. Using
+``tp_group.rank_in_group == 0`` instead happens to alias the boundary on
+the standard layout but makes non-boundary TP ranks skip the TP-internal
+broadcast leg of recv_metadata, which deadlocks the collective.
 """
 
 from unittest.mock import MagicMock, patch
@@ -40,7 +36,7 @@ def _make_groups(*, pp_world=2, tp_world=1, tp_rank=0, pp_rank=0):
     pp = MagicMock()
     pp.world_size = pp_world
     pp.rank_in_group = pp_rank
-    pp.ranks = list(range(pp_world))
+    pp.ranks = list(range(pp_world)) if pp_world > 1 else [0]
     pp.device_group = MagicMock(name="pp_device_group")
     pp.cpu_group = MagicMock(name="pp_cpu_group")
 
@@ -66,7 +62,8 @@ def test_split_tensor_dict_metadata_drops_real_tensors():
     assert keys["num_tokens"] == 4
 
 
-def test_send_metadata_only_fires_on_pp_rank0_tp_rank0():
+def test_send_metadata_fires_only_on_pp_boundary():
+    # PP boundary = the only rank whose pp_group has world_size == 2.
     pp, tp = _make_groups(pp_world=2, tp_world=2, tp_rank=0, pp_rank=0)
     payload = [("hidden_states", TensorMetadata("npu", torch.float16, (8, 16)))]
 
@@ -76,12 +73,13 @@ def test_send_metadata_only_fires_on_pp_rank0_tp_rank0():
     ):
         edge_cloud_send_metadata(payload)
 
-    # PP boundary + TP root => exactly one send_object call.
     pp.send_object.assert_called_once_with(payload, dst=1)
 
 
-def test_send_metadata_noop_on_tp_non_root():
-    pp, tp = _make_groups(pp_world=2, tp_world=4, tp_rank=2, pp_rank=0)
+def test_send_metadata_noop_on_non_pp_boundary():
+    # A non-boundary cloud TP rank lives in a singleton PP group
+    # (pp_group.world_size == 1) — sending would be undefined.
+    pp, tp = _make_groups(pp_world=1, tp_world=4, tp_rank=2, pp_rank=0)
     with (
         patch("vllm_ascend.distributed.parallel_state.get_pp_group", return_value=pp),
         patch("vllm_ascend.distributed.parallel_state.get_tp_group", return_value=tp),
@@ -91,18 +89,8 @@ def test_send_metadata_noop_on_tp_non_root():
     pp.send_object.assert_not_called()
 
 
-def test_send_metadata_noop_when_pp_world_is_one():
-    pp, tp = _make_groups(pp_world=1, tp_world=1, tp_rank=0, pp_rank=0)
-    with (
-        patch("vllm_ascend.distributed.parallel_state.get_pp_group", return_value=pp),
-        patch("vllm_ascend.distributed.parallel_state.get_tp_group", return_value=tp),
-    ):
-        edge_cloud_send_metadata([("k", 1)])
-
-    pp.send_object.assert_not_called()
-
-
-def test_recv_metadata_boundary_rank_uses_recv_object_then_broadcast():
+def test_recv_metadata_pp_boundary_recvs_then_broadcasts():
+    # Cloud PP boundary (pp_world=2): pull from peer, fan out to local TP.
     pp, tp = _make_groups(pp_world=2, tp_world=4, tp_rank=0, pp_rank=1)
     expected = [("hidden_states", TensorMetadata("npu", torch.float16, (8, 16)))]
     pp.recv_object.return_value = expected
@@ -118,8 +106,12 @@ def test_recv_metadata_boundary_rank_uses_recv_object_then_broadcast():
     assert got == expected
 
 
-def test_recv_metadata_tp_non_root_only_takes_broadcast():
-    pp, tp = _make_groups(pp_world=2, tp_world=4, tp_rank=3, pp_rank=1)
+def test_recv_metadata_non_boundary_only_takes_broadcast():
+    # Cloud non-boundary TP rank: pp_group is a singleton; the data must
+    # come exclusively from the TP-internal broadcast. This is the
+    # regression case that deadlocked with the previous
+    # ``tp_group.rank_in_group == 0`` selector.
+    pp, tp = _make_groups(pp_world=1, tp_world=4, tp_rank=3, pp_rank=0)
     expected = [("hidden_states", TensorMetadata("npu", torch.float16, (8, 16)))]
     tp.broadcast_object.return_value = expected
 
@@ -132,6 +124,20 @@ def test_recv_metadata_tp_non_root_only_takes_broadcast():
     pp.recv_object.assert_not_called()
     tp.broadcast_object.assert_called_once_with(None, src=0)
     assert got == expected
+
+
+def test_recv_metadata_no_tp_no_pp_returns_empty():
+    # Single-NPU edge or cloud (TP=1, PP=1): no peer, no broadcast needed.
+    pp, tp = _make_groups(pp_world=1, tp_world=1, tp_rank=0, pp_rank=0)
+    with (
+        patch("vllm_ascend.distributed.parallel_state.get_pp_group", return_value=pp),
+        patch("vllm_ascend.distributed.parallel_state.get_tp_group", return_value=tp),
+    ):
+        got = edge_cloud_recv_metadata()
+
+    pp.recv_object.assert_not_called()
+    tp.broadcast_object.assert_not_called()
+    assert got == []
 
 
 def test_isend_tensors_skips_empty_and_emits_no_metadata():
@@ -155,8 +161,8 @@ def test_isend_tensors_skips_empty_and_emits_no_metadata():
     pp.send_object.assert_not_called()
 
 
-def test_isend_tensors_noop_when_tp_non_root():
-    pp, tp = _make_groups(pp_world=2, tp_world=4, tp_rank=1, pp_rank=0)
+def test_isend_tensors_noop_on_non_pp_boundary():
+    pp, tp = _make_groups(pp_world=1, tp_world=4, tp_rank=1, pp_rank=0)
     real = torch.zeros(4, 8, dtype=torch.float16)
     with (
         patch("vllm_ascend.distributed.parallel_state.get_pp_group", return_value=pp),
@@ -192,16 +198,35 @@ def test_irecv_tensors_calls_buffer_provider_and_returns_handles():
             payload, buffer_provider=buffer_provider
         )
 
-    # buffer_provider only sees the tensor key; plain scalars passthrough.
     assert received_keys == ["hidden_states"]
     assert tensor_dict["hidden_states"] is pre_alloc
     assert tensor_dict["step"] == 12
     assert handles == [fake_handle]
     assert mock_irecv.call_count == 1
-    # TP world is 1 — postprocess must be a no-op (returns without
-    # touching torch.distributed.broadcast).
     assert callable(postprocess[0])
-    postprocess[0]()  # exercising the no-op branch does not raise
+    postprocess[0]()  # TP=1 → no-op branch must not raise
+
+
+def test_irecv_tensors_non_boundary_skips_irecv_but_keeps_buffer():
+    # Non-boundary TP rank: still allocates a buffer to participate in
+    # the upcoming TP broadcast, but does NOT issue a cross-domain irecv.
+    pp, tp = _make_groups(pp_world=1, tp_world=4, tp_rank=2, pp_rank=0)
+    meta = TensorMetadata("cpu", torch.float16, (4, 8))
+    payload = [("hidden_states", meta)]
+    pre_alloc = torch.zeros(4, 8, dtype=torch.float16)
+
+    with (
+        patch("vllm_ascend.distributed.parallel_state.get_pp_group", return_value=pp),
+        patch("vllm_ascend.distributed.parallel_state.get_tp_group", return_value=tp),
+        patch("torch.distributed.irecv") as mock_irecv,
+    ):
+        tensor_dict, handles, _ = edge_cloud_irecv_tensors(
+            payload, buffer_provider=lambda k, m: pre_alloc
+        )
+
+    assert tensor_dict["hidden_states"] is pre_alloc
+    assert handles == []
+    mock_irecv.assert_not_called()
 
 
 def test_irecv_tensors_empty_metadata_skips_irecv_but_keeps_buffer():
@@ -225,9 +250,8 @@ def test_irecv_tensors_empty_metadata_skips_irecv_but_keeps_buffer():
 
 
 def test_send_metadata_then_isend_tensors_does_not_call_send_object():
-    """Regression-style assertion of the core property: the tensor send
-    after pre-publish must NOT trigger any CPU pickle round-trip.
-    """
+    """Core property: the tensor send after pre-publish must NOT trigger any
+    CPU pickle round-trip."""
     pp, tp = _make_groups(pp_world=2, tp_world=1, tp_rank=0, pp_rank=0)
     tensors = {"hidden_states": torch.zeros(2, 4, dtype=torch.float16)}
     payload = split_tensor_dict_metadata(tensors)
