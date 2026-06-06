@@ -163,6 +163,11 @@ from vllm_ascend.model_loader.layer_shard_loader import (
     EdgeCloudLayerPlan,
     LayerShardLoader,
 )
+from vllm_ascend.distributed.parallel_state import (
+    edge_cloud_irecv_tensors,
+    edge_cloud_send_metadata,
+    split_tensor_dict_metadata,
+)
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
@@ -2080,6 +2085,16 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
+        # —— Edge-cloud: publish the metadata of the IntermediateTensors that
+        # ``_model_forward`` will produce, BEFORE it actually runs. This lets
+        # the peer pre-allocate its receive buffer and start ``irecv`` while
+        # the local forward is still computing; once forward returns the
+        # worker can ``isend`` the tensor body with zero metadata overhead.
+        self._maybe_send_edge_cloud_pp_metadata(
+            num_tokens_padded=num_tokens_padded,
+            intermediate_tensors=intermediate_tensors,
+            is_dummy_or_profile=False,
+        )
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -2663,6 +2678,158 @@ class NPUModelRunner(GPUModelRunner):
         if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
         return hidden_states
+
+    # ------------------------------------------------------------------
+    # Edge-cloud metadata pre-publish (control plane / data plane split)
+    # ------------------------------------------------------------------
+    # The vanilla ``isend_tensor_dict`` couples a synchronous CPU-pickle
+    # metadata round-trip with the cross-WAN tensor send. In the edge-cloud
+    # path, every per-step hidden_states / residual tensor has a shape /
+    # dtype that is fully determined BEFORE ``_model_forward`` runs (it
+    # only depends on ``num_tokens_padded`` and the model hidden_size).
+    # We therefore publish the metadata while forward is still computing
+    # so that, when forward finishes, ``edge_cloud_isend_tensors`` can
+    # push the payload with zero control-plane overhead.
+    #
+    # ``_compute_edge_cloud_pp_send_shape`` is the single source of truth
+    # for the output shape used both here (pre-publish) and in the actual
+    # post-forward send (see model_runner_v1.py:2128-2160).
+    def _compute_edge_cloud_pp_send_shape(
+        self, num_tokens_padded: int
+    ) -> int:
+        """First-dim of the IntermediateTensors that the current segment
+        will produce for the cross-domain PP send.
+
+        ``embedding_only`` edge pads to ``self.max_num_tokens`` so cloud's
+        pre-allocated buffer can ``copy_`` without a shape mismatch (see
+        the padding block at model_runner_v1.py:2138-2156). All other
+        edge-cloud paths emit ``num_tokens_padded`` rows.
+        """
+        if (
+            self.edge_cloud_cfg.mode == "embedding_only"
+            and self.edge_cloud_cfg.role == "edge"
+        ):
+            return self.max_num_tokens
+        return num_tokens_padded
+
+    def _maybe_send_edge_cloud_pp_metadata(
+        self,
+        num_tokens_padded: int,
+        intermediate_tensors: IntermediateTensors | None,
+        is_dummy_or_profile: bool = False,
+    ) -> None:
+        """Publish next-hop PP tensor metadata BEFORE ``_model_forward``.
+
+        Skipped on every dummy_run / profile / cudagraph-capture path so we
+        never emit a real cross-WAN object to a peer that is not expecting
+        anything. The actual tensor body is sent by the worker after
+        ``execute_model`` returns, via ``edge_cloud_isend_tensors``.
+        """
+        if not self._edge_cloud_enabled or is_dummy_or_profile:
+            return
+
+        role = self.edge_cloud_cfg.role
+        # An edge-cloud segment forwards data cross-domain only when its
+        # output goes to the peer. For ``edge``: segment_a/head emits
+        # intermediate_tensors=None on input and IntermediateTensors on
+        # output that must travel to cloud. ``segment_e``/tail receives
+        # intermediate_tensors and produces final hidden_states locally
+        # (no cross-domain send). For ``cloud``: every forward output is
+        # IntermediateTensors that returns to edge.
+        if role == "edge" and intermediate_tensors is not None:
+            # Tail segment — its output stays on edge for sampling.
+            return
+        if role not in ("edge", "cloud"):
+            return
+
+        first_dim = self._compute_edge_cloud_pp_send_shape(num_tokens_padded)
+        hidden_size = self.model_config.get_hidden_size()
+        # ``hidden_states`` and ``residual`` always come as the two-key
+        # IntermediateTensors that the qwen3_5 edge-cloud segment returns
+        # (see patch/models/qwen3_5_edge_cloud.py:71-76).
+        try:
+            template = self.model.make_empty_intermediate_tensors(
+                batch_size=first_dim, dtype=self.dtype, device=self.device
+            )
+        except Exception:  # noqa: BLE001 - fall back to manual shape spec
+            # If the model does not expose ``make_empty_intermediate_tensors``
+            # we synthesize a metadata payload directly. Both ascend
+            # segments use the same two-key dict, so we can hard-code it.
+            metadata_payload = split_tensor_dict_metadata({
+                "hidden_states": torch.empty(
+                    (first_dim, hidden_size),
+                    dtype=self.dtype,
+                    device=self.device,
+                ),
+                "residual": torch.empty(
+                    (first_dim, hidden_size),
+                    dtype=self.dtype,
+                    device=self.device,
+                ),
+            })
+        else:
+            metadata_payload = split_tensor_dict_metadata(dict(template.items()))
+
+        edge_cloud_send_metadata(metadata_payload)
+
+    def _build_edge_cloud_async_intermediate_tensors(
+        self,
+        metadata_payload: list,
+    ) -> "AsyncIntermediateTensors":
+        """Construct an ``AsyncIntermediateTensors`` whose backing buffers
+        come from ``self.intermediate_tensors`` (the pre-allocated
+        ``max_num_tokens`` buffer the runner already owns) and whose recv
+        handles run in parallel with the upcoming ``_model_forward``.
+
+        ``metadata_payload`` is exactly what
+        ``edge_cloud_recv_metadata`` returned on the worker side. The
+        per-tensor first-dim is read directly from each ``TensorMetadata``
+        so callers do not need to know the sender's padding policy
+        (head_tail uses ``num_tokens_padded``; embedding_only edge pads to
+        ``max_num_tokens`` — see model_runner_v1.py:2138-2156).
+        """
+        from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
+
+        # Lazily build the runner buffer the first time we need it. After
+        # this the same NPU tensor is reused for every step (zero alloc).
+        if self.intermediate_tensors is None:
+            max_actual_tokens = self.max_num_tokens
+            if enable_sp():
+                tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+                max_actual_tokens = (
+                    self.max_num_tokens + tp_size - 1
+                ) // tp_size
+            self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
+                batch_size=max_actual_tokens,
+                dtype=self.dtype,
+                device=self.device,
+            )
+
+        def buffer_provider(key: str, meta) -> torch.Tensor:
+            # Carve a contiguous slice from the runner's pre-allocated
+            # ``max_num_tokens``-sized buffer to match the sender's exact
+            # shape (encoded in the metadata). This mirrors the slicing
+            # done at model_runner_v1.py:3321-3323 for the standard PP
+            # receive path.
+            row_count = int(meta.size[0])
+            buf = self.intermediate_tensors[key]
+            if row_count > buf.shape[0]:
+                # Sender padded beyond our buffer (should not happen given
+                # both sides share ``max_num_tokens``); fall back to fresh
+                # alloc to stay correct.
+                return torch.empty(
+                    meta.size, dtype=meta.dtype, device=self.device
+                )
+            return buf[:row_count]
+
+        tensor_dict, handles, postprocess = edge_cloud_irecv_tensors(
+            metadata_payload, buffer_provider=buffer_provider
+        )
+        return AsyncIntermediateTensors(
+            tensor_dict,
+            comm_handles=handles,
+            comm_postprocess=postprocess,
+        )
 
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
         # Pad tokens to multiple of tensor_parallel_size when

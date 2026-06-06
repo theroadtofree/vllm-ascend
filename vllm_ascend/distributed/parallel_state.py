@@ -424,3 +424,221 @@ def edge_cloud_broadcast_recv() -> tuple[
             handle.wait()
 
     return recv_tensor_dict, [], [broadcast_postprocess]
+
+
+# ---------------------------------------------------------------------------
+# Edge-cloud split metadata / tensor transfer (WAN-latency optimization)
+#
+# Motivation: ``isend_tensor_dict`` couples metadata (TensorMetadata describing
+# dtype / shape / device) and the tensor payload on the same critical path: it
+# first ``send_object(metadata_list)`` (a synchronous CPU pickle round-trip)
+# and only then ``isend`` each tensor. On a cross-WAN edge-cloud link, the
+# extra synchronous metadata round-trip happens right after ``_model_forward``
+# completes — exactly the moment we want hidden_states to start flowing.
+#
+# Because every per-step PP tensor's dtype/shape is fully determined before
+# ``_model_forward`` runs (it only depends on ``num_tokens_padded`` and the
+# model's hidden_size), we can pre-publish the metadata while forward is still
+# computing, and once forward finishes, send only the raw tensor data.
+#
+# The helpers below intentionally mirror the structure of
+# ``edge_cloud_broadcast_recv`` / ``isend_tensor_dict`` so callers can switch
+# in/out of the split-channel path with minimal change.
+# ---------------------------------------------------------------------------
+
+
+def edge_cloud_send_metadata(
+    metadata_payload: list[tuple[str, Any]],
+    dst: int | None = None,
+) -> None:
+    """Send a tensor_dict's metadata-only description on the PP channel.
+
+    ``metadata_payload`` is the list produced by ``_split_tensor_dict`` (i.e.
+    each entry is ``(key, TensorMetadata)`` for tensors and ``(key, value)``
+    for plain Python scalars). The receiver pre-allocates buffers from this
+    list and starts ``irecv`` immediately, so ``edge_cloud_isend_tensors``
+    afterwards carries no metadata overhead.
+
+    This call is fire-and-forget on the PP rank0 sender. TP ranks > 0 do
+    nothing (the TP-side broadcast is folded into the tensor receive path).
+    """
+    pp_group = get_pp_group()
+    if pp_group.world_size <= 1:
+        return
+
+    # Only PP rank 0 (the "boundary" rank that owns the cross-domain link)
+    # is responsible for the actual cross-domain metadata send. Other TP ranks
+    # will receive their copy via the TP-internal broadcast that happens
+    # inside ``edge_cloud_recv_metadata`` on the peer side.
+    tp_group = get_tp_group()
+    if tp_group.rank_in_group != 0:
+        return
+
+    if dst is None:
+        dst = (pp_group.rank_in_group + 1) % pp_group.world_size
+    pp_group.send_object(metadata_payload, dst=dst)
+
+
+def edge_cloud_recv_metadata(
+    src: int | None = None,
+) -> list[tuple[str, Any]]:
+    """Receive the metadata published by ``edge_cloud_send_metadata``.
+
+    Returns the metadata_list ``[(key, TensorMetadata | value), ...]`` from
+    which the caller is expected to allocate or reuse receive buffers and then
+    invoke ``edge_cloud_irecv_tensors`` to start the actual tensor transfer.
+
+    On the receiving side, PP rank 0 takes the cross-domain ``recv_object`` and
+    broadcasts the result inside the local TP group; other TP ranks just take
+    the broadcast.
+    """
+    pp_group = get_pp_group()
+    tp_group = get_tp_group()
+    if pp_group.world_size <= 1:
+        return []
+
+    if tp_group.rank_in_group == 0:
+        if src is None:
+            src = (pp_group.rank_in_group - 1) % pp_group.world_size
+        metadata_payload = pp_group.recv_object(src=src)
+        # Distribute the metadata across the TP group so every rank can size
+        # its own receive buffer in lockstep.
+        tp_group.broadcast_object(metadata_payload, src=0)
+    else:
+        metadata_payload = tp_group.broadcast_object(None, src=0)
+
+    if metadata_payload is None:
+        metadata_payload = []
+    return metadata_payload
+
+
+def edge_cloud_isend_tensors(
+    tensor_dict: dict[str, torch.Tensor | Any],
+    dst: int | None = None,
+) -> list[Handle]:
+    """Send the tensor payload of a tensor_dict WITHOUT any metadata exchange.
+
+    Assumes ``edge_cloud_send_metadata`` was already called earlier in the
+    step with a payload describing exactly the same tensor keys / dtypes /
+    shapes that appear in ``tensor_dict``. Only the PP rank 0 (TP rank 0)
+    issues the cross-domain ``isend``; other TP ranks return an empty handle
+    list (the receiver fans the tensors out via TP-internal broadcast).
+    """
+    pp_group = get_pp_group()
+    if pp_group.world_size <= 1:
+        return []
+
+    tp_group = get_tp_group()
+    if tp_group.rank_in_group != 0:
+        return []
+
+    if dst is None:
+        dst = (pp_group.rank_in_group + 1) % pp_group.world_size
+
+    handles: list[Handle] = []
+    group = pp_group.device_group
+    metadata_group = pp_group.cpu_group
+    for _, tensor in tensor_dict.items():
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        if tensor.numel() == 0:
+            continue
+        comm_group = metadata_group if tensor.is_cpu else group
+        handle = torch.distributed.isend(
+            tensor, dst=pp_group.ranks[dst], group=comm_group
+        )
+        if tensor.is_cuda:
+            tensor.record_stream(torch.cuda.current_stream(tensor.device))
+        handles.append(handle)
+    return handles
+
+
+def edge_cloud_irecv_tensors(
+    metadata_payload: list[tuple[str, Any]],
+    buffer_provider: Callable[[str, TensorMetadata], torch.Tensor],
+    src: int | None = None,
+) -> tuple[
+    dict[str, torch.Tensor | Any],
+    list[Handle],
+    list[Callable[[], None]],
+]:
+    """Start an async cross-domain tensor receive using pre-known metadata.
+
+    ``buffer_provider(key, TensorMetadata)`` is called for every tensor key
+    and must return a contiguous device tensor of matching dtype/shape (the
+    intent is to hand back a slice of the runner's pre-allocated
+    ``self.intermediate_tensors`` buffer to avoid an extra ``torch.empty``).
+    Non-tensor metadata entries are forwarded verbatim.
+
+    Returns ``(tensor_dict, comm_handles, comm_postprocess)``. The TP-internal
+    broadcast is folded into ``comm_postprocess`` so the receiver behaves the
+    same way as the existing ``edge_cloud_broadcast_recv`` (use with
+    ``AsyncIntermediateTensors`` for lazy wait).
+    """
+    pp_group = get_pp_group()
+    tp_group = get_tp_group()
+    if pp_group.world_size <= 1:
+        return {}, [], []
+
+    if src is None:
+        src = (pp_group.rank_in_group - 1) % pp_group.world_size
+
+    tensor_dict: dict[str, torch.Tensor | Any] = {}
+    handles: list[Handle] = []
+    is_pp_boundary = tp_group.rank_in_group == 0
+
+    group = pp_group.device_group
+    metadata_group = pp_group.cpu_group
+
+    for key, value in metadata_payload:
+        if isinstance(value, TensorMetadata):
+            tensor = buffer_provider(key, value)
+            tensor_dict[key] = tensor
+            if tensor.numel() == 0:
+                continue
+            if is_pp_boundary:
+                comm_group = metadata_group if tensor.is_cpu else group
+                handles.append(
+                    torch.distributed.irecv(
+                        tensor, src=pp_group.ranks[src], group=comm_group
+                    )
+                )
+        else:
+            tensor_dict[key] = value
+
+    def tp_broadcast_postprocess() -> None:
+        # After the cross-domain irecv completes on rank 0, fan the tensors
+        # out across the local TP group so every rank sees the same data.
+        if tp_group.world_size <= 1:
+            return
+        bcast_handles = []
+        for tensor in tensor_dict.values():
+            if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+                continue
+            bcast_group = (
+                tp_group.cpu_group if tensor.is_cpu else tp_group.device_group
+            )
+            bcast_handles.append(
+                torch.distributed.broadcast(
+                    tensor,
+                    src=tp_group.ranks[0],
+                    group=bcast_group,
+                    async_op=True,
+                )
+            )
+        for handle in bcast_handles:
+            handle.wait()
+
+    return tensor_dict, handles, [tp_broadcast_postprocess]
+
+
+def split_tensor_dict_metadata(
+    tensor_dict: dict[str, torch.Tensor | Any],
+) -> list[tuple[str, Any]]:
+    """Public re-export of ``_split_tensor_dict`` returning only the metadata
+    list. Convenience wrapper so callers can construct the payload from a real
+    tensor_dict (e.g. when the sender already has the future-shape buffers
+    around) without importing vllm-internal symbols.
+    """
+    metadata_list, _ = _split_tensor_dict(tensor_dict)
+    return metadata_list

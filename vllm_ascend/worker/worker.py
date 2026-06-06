@@ -59,7 +59,8 @@ from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import (
-    edge_cloud_broadcast_recv,
+    edge_cloud_isend_tensors,
+    edge_cloud_recv_metadata,
     init_ascend_model_parallel,
 )
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
@@ -441,11 +442,18 @@ class NPUWorker(WorkerBase):
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass:
             if is_cloud_device():
-                tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
-                intermediate_tensors = AsyncIntermediateTensors(
-                    tensor_dict,
-                    comm_handles=comm_handles,
-                    comm_postprocess=comm_postprocess,
+                # Edge-cloud split-channel receive: metadata was published by
+                # the edge runner BEFORE its forward, so by the time we get
+                # here it is already on the wire / arrived. We pull it, hand
+                # it (with a buffer slice from the runner's pre-allocated
+                # ``intermediate_tensors``) to ``irecv``, and wrap as an
+                # ``AsyncIntermediateTensors`` whose ``.wait_for_comm`` will
+                # be invoked lazily when ``_preprocess`` first reads it.
+                metadata_payload = edge_cloud_recv_metadata()
+                intermediate_tensors = (
+                    self.model_runner._build_edge_cloud_async_intermediate_tensors(
+                        metadata_payload,
+                    )
                 )
             elif not get_pp_group().is_first_rank:
                 # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
@@ -477,13 +485,21 @@ class NPUWorker(WorkerBase):
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config
         if is_edge_device():
+            # Edge head segment finished — push the tensor body only.
+            # The metadata for these tensors has already been published
+            # by ``_maybe_send_edge_cloud_pp_metadata`` before the local
+            # forward started, so this send carries no control-plane RTT.
             if get_pp_group().world_size == 2:
-                self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
-            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
-            intermediate_tensors = AsyncIntermediateTensors(
-                tensor_dict,
-                comm_handles=comm_handles,
-                comm_postprocess=comm_postprocess,
+                self._pp_send_work = edge_cloud_isend_tensors(output.tensors)
+            # Receive cloud's reply for the tail segment. Symmetric to the
+            # cloud-side recv above: metadata first (already arrived from
+            # cloud's pre-forward publish), then the actual tensor irecv
+            # into a slice of the runner's pre-allocated buffer.
+            metadata_payload = edge_cloud_recv_metadata()
+            intermediate_tensors = (
+                self.model_runner._build_edge_cloud_async_intermediate_tensors(
+                    metadata_payload,
+                )
             )
             output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
             if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
@@ -491,8 +507,9 @@ class NPUWorker(WorkerBase):
             return output
 
         if is_cloud_device():
+            # Cloud middle segment finished — metadata was pre-published.
             if get_pp_group().world_size == 2:
-                self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
+                self._pp_send_work = edge_cloud_isend_tensors(output.tensors)
         else:
             assert parallel_config.distributed_executor_backend != ("external_launcher") and not get_pp_group().is_last_rank
             # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
