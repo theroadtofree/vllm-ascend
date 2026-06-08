@@ -565,6 +565,12 @@ def _patched_build(
         num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
         fast_build=fast_build,
     )
+    # GDN 层不参与 update_full_graph_params（没有 attn_params/handles/events),
+    # 设置 skip_graph_params_update 标记让 _update_full_graph_params_if_needed
+    # 中的外层 filter（model_runner_v1.py:2708-2710) 跳过此 metadata，
+    # 避免 update_graph_params 中对 GDNAttentionMetadata 访问 seq_lens_list 等
+    # FlashAttention 专有属性时报 AttributeError。
+    attn_metadata.skip_graph_params_update = True
     attn_metadata.non_spec_prefill_fallback_meta = None
     if attn_metadata.num_prefills <= 0:
         return attn_metadata

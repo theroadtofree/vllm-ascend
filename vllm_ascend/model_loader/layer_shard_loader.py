@@ -113,6 +113,15 @@ class LayerShardLoader:
             lm_head = getattr(language_model, "lm_head", None)
             if lm_head is not None and not isinstance(lm_head, PPMissingLayer):
                 language_model.lm_head = PPMissingLayer()
+            # Cloud side does not need vision components for VL models.
+            for attr in ("vision_tower", "multi_modal_projector", "mm_projector"):
+                module = getattr(model, attr, None)
+                if module is not None and not isinstance(module, PPMissingLayer):
+                    setattr(model, attr, PPMissingLayer())
+                    logger.info(
+                        "[LayerShardLoader] Replaced %s with PPMissingLayer on cloud",
+                        attr,
+                    )
 
         if compilation_config is not None:
             cls._clean_compilation_config(model, compilation_config)
