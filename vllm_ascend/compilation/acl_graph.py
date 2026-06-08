@@ -274,18 +274,12 @@ def update_full_graph_params(
     graph_params: GraphParams | None = None,
     draft_graph_params: GraphParams | None = None,
 ):
-    """更新 attention 图参数，供下一次图回放使用。
-    标准流程使用全局 GraphParams；边云流程为每个 segment 传入独立
-    GraphParams，避免 segment_a / segment_e 的 task handle 相互错配。
-    """
     with graph_params_scope(graph_params, draft_graph_params):
         impl_cls = attn_backend.get_impl_cls()
 
         original_metadata = None
 
         if layer_indices is not None:
-            # 强制要求 layer_indices 为升序自然层号，与图捕获时 islice(self.layers)
-            # 的遍历顺序严格一致，防止 zip(attn_keys, attn_params) 错位
             assert layer_indices == sorted(layer_indices), (
                 "layer_indices must be in ascending natural order to align with "
                 "graph_params.attn_params append order."
@@ -313,16 +307,6 @@ def _filter_attn_metadata_for_layers(
     attn_metadata: dict,
     layer_indices: list[int],
 ) -> dict:
-    """返回仅包含指定层索引对应条目的 dict，key 顺序与 layer_indices 一致。
-
-    attn_metadata 的 key 格式通常为 ``"model.layers.3.self_attn"``。
-    通过匹配 ``.layers.{idx}.`` 子串来定位目标层。
-
-    重要：边云流程中图捕获按自然层顺序遍历（islice(self.layers)），
-    graph_params.attn_params 也按该顺序追加。因此过滤后必须保持
-    layer_indices 的自然顺序，使 update_graph_params 的 zip 配对
-    与图捕获顺序严格对齐，避免错位。
-    """
     result: dict = {}
     skipped_no_key_layers: list[int] = []
     for idx in layer_indices:
@@ -331,18 +315,12 @@ def _filter_attn_metadata_for_layers(
         if not matched_keys:
             skipped_no_key_layers.append(idx)
             continue
-        # 边云流程要求每层恰好一个 attention metadata key，
-        # 以确保 graph_params.attn_params 的追加顺序与过滤后顺序 1:1 对齐。
-        # 若未来模型引入 cross-attn / multi-head 拆分，需同步调整此逻辑。
         if len(matched_keys) > 1:
             raise ValueError(
                 f"Layer {idx} has multiple attention metadata keys: {matched_keys}. "
                 f"This breaks the 1:1 alignment between attn_metadata and attn_params."
             )
-        # update_graph_params 的 zip(attn_keys, attn_params) 要求
-        # 两者对齐。skip_graph_params_update 层的 metadata 已被
-        # _update_full_graph_params_if_needed 在上游 dict 级别过滤，
-        # 因此不会出现在这里。
+
         result[matched_keys[0]] = attn_metadata[matched_keys[0]]
 
     return result
@@ -386,8 +364,6 @@ def graph_params_scope(
     try:
         yield
     finally:
-        # 在切回旧的 graph_params 之前，确保当前流上所有 attention 参数更新任务
-        # 已全部完成，避免异步流仍在引用本段 graph_params 导致 task handle 错配
         if graph_params is not None:
             torch.npu.current_stream().synchronize()
         _active_graph_params = old_graph_params
