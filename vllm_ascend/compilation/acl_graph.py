@@ -275,7 +275,6 @@ def update_full_graph_params(
     draft_graph_params: GraphParams | None = None,
 ):
     """更新 attention 图参数，供下一次图回放使用。
-
     标准流程使用全局 GraphParams；边云流程为每个 segment 传入独立
     GraphParams，避免 segment_a / segment_e 的 task handle 相互错配。
     """
