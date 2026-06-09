@@ -203,7 +203,7 @@ class AscendConfig:
         self.enable_mc2_hierarchy_comm = additional_config.get("enable_mc2_hierarchy_comm", False)
 
         edge_cloud_config = additional_config.get("edge_cloud_config", {})
-        self.edge_cloud_config = EdgeCloudConfig(edge_cloud_config)
+        self.edge_cloud_config = EdgeCloudConfig(edge_cloud_config, vllm_config)
 
         self.mix_placement = additional_config.get("mix_placement", False)
         self._check_mix_placement()
@@ -600,7 +600,11 @@ class EplbConfig:
 class EdgeCloudConfig:
     """Configuration for edge-cloud collaborative inference."""
 
-    def __init__(self, user_config: dict | None = None):
+    def __init__(
+        self,
+        user_config: dict | None = None,
+        vllm_config: "VllmConfig | None" = None,
+    ):
         if user_config is None:
             user_config = {}
         self.enabled: bool = user_config.get("enabled", False)
@@ -611,6 +615,12 @@ class EdgeCloudConfig:
         self.decode_graph_min_tokens: int = user_config.get("decode_graph_min_tokens", 1)
         self.transfer_config: dict = user_config.get("transfer_config", {})
         self.hidden_dtype: str = user_config.get("hidden_dtype", "bf16")
+
+        # Keep a handle to vllm_config so _validate() can inspect orthogonal
+        # parallel features (PCP/DCP) that are incompatible with edge-cloud's
+        # metadata-free PP transfer. Optional to preserve direct-construction
+        # call sites (mainly tests) that don't have a vllm_config handy.
+        self._vllm_config = vllm_config
 
         if self.enabled:
             self._validate()
@@ -643,6 +653,39 @@ class EdgeCloudConfig:
             raise ValueError(
                 "edge_cloud_config.edge_head_tail_layers must be positive in "
                 f"'head_tail' mode, got head_k={head_k}, tail_k={tail_k}"
+            )
+
+        self._validate_incompatible_parallel_features()
+
+    def _validate_incompatible_parallel_features(self):
+        """Reject parallel features that break the metadata-free PP path.
+
+        Context Parallelism (PCP/DCP) rewrites ``total_num_scheduled_tokens``
+        inside ``_prepare_inputs`` and runs an all-gather/index-select on
+        hidden states via ``PCPManager.get_restore_hidden_states``. The
+        edge-cloud receiver allocates PP buffers from the *original*
+        ``SchedulerOutput.total_num_scheduled_tokens``, and the PCP restore
+        path does not understand ``IntermediateTensors``. Mixing them
+        silently produces wrong shapes or crashes deep in HCCL, so fail
+        fast here instead of at runtime.
+        """
+        if self._vllm_config is None:
+            # No vllm_config available (e.g. direct unit-test construction):
+            # skip cross-feature checks, the runtime will surface any issue.
+            return
+        parallel_cfg = self._vllm_config.parallel_config
+        pcp = getattr(parallel_cfg, "prefill_context_parallel_size", 1)
+        dcp = getattr(parallel_cfg, "decode_context_parallel_size", 1)
+        if pcp > 1 or dcp > 1:
+            raise ValueError(
+                "edge_cloud_config.enabled=True is incompatible with "
+                "context parallelism. Got "
+                f"prefill_context_parallel_size={pcp}, "
+                f"decode_context_parallel_size={dcp}. "
+                "PCP/DCP rewrite total_num_scheduled_tokens and run an "
+                "all-gather/index-select on hidden states that the "
+                "edge-cloud metadata-free PP path cannot represent. "
+                "Set both to 1, or disable edge_cloud_config."
             )
 
     @property

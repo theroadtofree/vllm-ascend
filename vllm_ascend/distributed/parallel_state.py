@@ -436,6 +436,7 @@ def destroy_ascend_model_parallel():
 def edge_cloud_isend_tensor_dict(
     tensor_dict: dict[str, torch.Tensor | Any],
     dst: int | None = None,
+    num_tokens: int | None = None,
 ) -> list[Handle]:
     """Send tensor dict without metadata sync (edge-cloud optimized).
 
@@ -445,6 +446,22 @@ def edge_cloud_isend_tensor_dict(
 
     This eliminates the inter-node pickle+Gloo metadata exchange that
     the standard GroupCoordinator.isend_tensor_dict performs.
+
+    Args:
+        tensor_dict: tensors to send. Non-tensor / zero-numel entries are
+            skipped, matching the receiver's allocation logic.
+        dst: destination rank in PP group (default: next rank).
+        num_tokens: when provided, each tensor is sliced to
+            ``tensor[:num_tokens]`` along dim-0 before send. This pushes the
+            sender/receiver shape-alignment responsibility to the sender so
+            that the receiver can safely allocate buffers based on
+            ``SchedulerOutput.total_num_scheduled_tokens`` alone (no
+            metadata wire transfer needed). The slice is a zero-copy view
+            and adds negligible overhead. Must be set whenever the model
+            forward may produce padded outputs (cudagraph / SP / DP padding,
+            etc.). When ``None``, tensors are sent as-is preserving the
+            previous behavior for callers that already guarantee unpadded
+            output.
     """
     pp_group = get_pp_group()
     if pp_group.world_size <= 1:
@@ -455,12 +472,43 @@ def edge_cloud_isend_tensor_dict(
 
     group = pp_group.device_group
 
+    # Guard against silent key/order drift between sender and receiver.
+    # The receiver iterates ec_meta.metadata_list in a fixed order; if the
+    # sender's tensor_dict adds, drops, or reorders keys (e.g. a future
+    # model patch starts returning an extra entry in IntermediateTensors),
+    # the wire payload no longer matches the receiver's pre-allocated
+    # buffers �� and because there is no metadata exchange anymore, the
+    # mismatch would corrupt data silently or only surface as an HCCL
+    # crash. Fail fast here with a precise message instead.
+    ec_meta = get_edge_cloud_tensor_meta()
+    sender_tensor_keys = [
+        k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)
+    ]
+    assert sender_tensor_keys == ec_meta.tensor_keys, (
+        "edge_cloud_isend_tensor_dict: tensor key set/order does not match "
+        f"the pre-computed EdgeCloudTensorMeta. sender={sender_tensor_keys}, "
+        f"expected={ec_meta.tensor_keys}. If this is a new model, extend "
+        "init_edge_cloud_tensor_meta() so both sides agree."
+    )
+
     handles: list[Handle] = []
-    for key, value in tensor_dict.items():
+    for _, value in tensor_dict.items():
         if not isinstance(value, torch.Tensor):
             continue
         if value.numel() == 0:
             continue
+        # Slice to the receiver-expected length so the wire shape exactly
+        # matches the buffer the receiver pre-allocates from num_tokens.
+        # This is a view (no copy) and is the cheapest way to defeat
+        # cudagraph / SP / DP padding mismatches without a metadata
+        # exchange.
+        if num_tokens is not None and value.shape[0] > num_tokens:
+            value = value[:num_tokens]
+        if not value.is_contiguous():
+            # isend requires contiguous storage; a non-contiguous slice
+            # only happens when upstream code returned a non-standard
+            # layout, in which case we materialize once.
+            value = value.contiguous()
         handle = torch.distributed.isend(
             value, dst=pp_group.ranks[dst], group=group
         )
@@ -555,8 +603,8 @@ def edge_cloud_broadcast_recv(
 
         # Broadcast locally-computed metadata + num_tokens to other TP ranks
         # so they can allocate tensors (this is intra-node, fast)
-        metadata_list = ec_meta.metadata_list
-        tp_group.broadcast_object([num_tokens, metadata_list], src=0)
+        ###metadata_list = ec_meta.metadata_list
+        ###tp_group.broadcast_object([num_tokens, metadata_list], src=0)
 
         def broadcast_postprocess():
             _, tensor_list = _split_tensor_dict(tensor_dict) if tensor_dict else (None, [])
@@ -578,9 +626,11 @@ def edge_cloud_broadcast_recv(
 
     # Non-PP-NPU0 ranks: receive metadata from NPU 0 via TP broadcast,
     # allocate tensors, then broadcast-recv actual data
-    broadcast_data = tp_group.broadcast_object(None, src=0)
-    recv_num_tokens = broadcast_data[0]
-    metadata_list = broadcast_data[1]
+    ###broadcast_data = tp_group.broadcast_object(None, src=0)
+    #recv_num_tokens = broadcast_data[0]
+    #metadata_list = broadcast_data[1]
+    metadata_list = ec_meta.metadata_list
+    recv_num_tokens = num_tokens
     if metadata_list is None:
         metadata_list = []
 

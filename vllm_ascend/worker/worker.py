@@ -482,6 +482,10 @@ class NPUWorker(WorkerBase):
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass:
             if is_cloud_device():
+                # Pre-compute input preparation while edge runs segment_a.
+                # This overlaps cloud's _update_states, _prepare_inputs,
+                # _determine_batch_execution_and_padding, and
+                # _build_attention_metadata with edge's segment_a forward.
                 tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
                     num_tokens=scheduler_output.total_num_scheduled_tokens,
                 )
@@ -521,7 +525,14 @@ class NPUWorker(WorkerBase):
         parallel_config = self.vllm_config.parallel_config
         if is_edge_device():
             if get_pp_group().world_size == 2:
-                self._pp_send_work = edge_cloud_isend_tensor_dict(output.tensors)
+                # Pass scheduler total so the sender slices off any
+                # cudagraph / SP / DP padding, letting the cloud receiver
+                # allocate buffers from SchedulerOutput.total_num_scheduled_tokens
+                # without an inter-node metadata exchange.
+                self._pp_send_work = edge_cloud_isend_tensor_dict(
+                    output.tensors,
+                    num_tokens=scheduler_output.total_num_scheduled_tokens,
+                )
             tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
                 num_tokens=scheduler_output.total_num_scheduled_tokens,
             )
@@ -537,7 +548,16 @@ class NPUWorker(WorkerBase):
 
         if is_cloud_device():
             if get_pp_group().world_size == 2:
-                self._pp_send_work = edge_cloud_isend_tensor_dict(output.tensors)
+                # Cloud segment_c runs through full transformer layers and
+                # almost always with cudagraph / SP / DP padding enabled, so
+                # output.tensors[k].shape[0] >= scheduler_output.total. Slice
+                # back to the unpadded length on the sender side so the edge
+                # receiver can keep allocating buffers from scheduler total
+                # alone (no metadata wire transfer needed).
+                self._pp_send_work = edge_cloud_isend_tensor_dict(
+                    output.tensors,
+                    num_tokens=scheduler_output.total_num_scheduled_tokens,
+                )
         else:
             assert parallel_config.distributed_executor_backend != ("external_launcher") and not get_pp_group().is_last_rank
             # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
