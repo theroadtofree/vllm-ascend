@@ -103,6 +103,27 @@ class HiddenChannelManager:
         return list(self._head_token_to_channel.values())
 
 
+class _NoChunkSentinel:
+    """Minimal ec_connector stand-in that disables chunking in parent Scheduler.
+
+    临时设为 ``Scheduler.ec_connector``，使父 ``Scheduler.schedule()``
+    跳过 token_budget / long_prefill_token_threshold / enable_chunked_prefill
+    三个chunking限制——与真实ec_connector的bypass行为一致。
+
+    PD分离不使用ec_connector的encoder-cache或metadata功能，
+    因此所有方法为no-op。
+    """
+
+    def update_state_after_alloc(self, request, index):
+        pass
+
+    def build_connector_meta(self, scheduler_output):
+        return None
+
+    def has_cache_item(self, identifier):
+        return False
+
+
 class PDSeparatedScheduler(Scheduler):
     """Scheduler that separates prefill and decode into distinct steps.
 
@@ -282,15 +303,43 @@ class PDSeparatedScheduler(Scheduler):
         saved_chunk_prefill_first = self.chunk_prefill_first
         saved_max_num_running_reqs = self.max_num_running_reqs
 
+        # 保存父调度器的chunking相关参数，临时禁用以确保
+        # 每个prefill请求一步内完整调度（is_prefill_chunk始终为False）。
+        # PD分离下chunked prefill需要多次edge→cloud→edge往返，极其低效。
+        saved_ec_connector = self.ec_connector
+        saved_max_num_scheduled_tokens = self.max_num_scheduled_tokens
+        saved_long_prefill_token_threshold = (
+            self.scheduler_config.long_prefill_token_threshold
+        )
+
         self.running = list(saved_chunk_prefill_first)
         self.chunk_prefill_first = []
         self.max_num_running_reqs -= len(saved_running)
+
+        # 禁用父调度器的所有chunking限制：
+        # 1. ec_connector非None → 跳过token_budget/long_prefill_token_threshold/
+        #    enable_chunked_prefill三个限制（与真实ec_connector bypass一致）
+        # 2. 扩大max_num_scheduled_tokens → 纵深防御
+        # 3. 设long_prefill_token_threshold=0 → 纵深防御
+        self.ec_connector = _NoChunkSentinel()
+        self.max_num_scheduled_tokens = 2**31
+        self.scheduler_config.long_prefill_token_threshold = 0
 
         scheduler_output = None
         try:
             scheduler_output = super().schedule()
         finally:
             self.max_num_running_reqs = saved_max_num_running_reqs
+            # 恢复父调度器的chunking限制
+            self.ec_connector = saved_ec_connector
+            self.max_num_scheduled_tokens = saved_max_num_scheduled_tokens
+            self.scheduler_config.long_prefill_token_threshold = (
+                saved_long_prefill_token_threshold
+            )
+            # 清除sentinel可能设置的ec_connector_metadata
+            if scheduler_output is not None:
+                scheduler_output.ec_connector_metadata = None
+
             if scheduler_output is not None:
                 if scheduler_output.total_num_scheduled_tokens == 0:
                     scheduler_output.batch_type = BatchType.EMPTY
@@ -309,6 +358,14 @@ class PDSeparatedScheduler(Scheduler):
                 new_prefill_completed = [
                     req for req in self.running if not req.is_prefill_chunk
                 ]
+                # 防御性检查：PD分离下不应出现chunked prefill
+                if new_chunk_prefill_first:
+                    logger.warning(
+                        "[PD] %d request(s) still have is_prefill_chunk=True "
+                        "after disabling chunking limits. This should not "
+                        "happen and may indicate a bug or KV cache exhaustion.",
+                        len(new_chunk_prefill_first),
+                    )
                 for req in self.chunk_prefill_first:
                     if req not in new_chunk_prefill_first:
                         new_chunk_prefill_first.append(req)
