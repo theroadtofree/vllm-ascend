@@ -282,41 +282,15 @@ class PDSeparatedScheduler(Scheduler):
         saved_chunk_prefill_first = self.chunk_prefill_first
         saved_max_num_running_reqs = self.max_num_running_reqs
 
-        # 保存父调度器的chunking相关参数，临时禁用以确保
-        # 每个prefill请求一步内完整调度（is_prefill_chunk始终为False）。
-        # PD分离下chunked prefill需要多次edge→cloud→edge往返，极其低效。
-        #
-        # 禁用策略（精准，不绕过token_budget）：
-        #   1. long_prefill_token_threshold=0 → 移除单请求token上限（chunking主因）
-        #   2. enable_chunked_prefill=False → waiting请求装不下就不调度，不部分调度
-        # 注意：不扩大max_num_scheduled_tokens，因为model_runner的预分配buffer
-        # （positions、query_pos等）按max_num_batched_tokens分配，超限会导致越界。
-        saved_long_prefill_token_threshold = (
-            self.scheduler_config.long_prefill_token_threshold
-        )
-        saved_enable_chunked_prefill = (
-            self.scheduler_config.enable_chunked_prefill
-        )
-
         self.running = list(saved_chunk_prefill_first)
         self.chunk_prefill_first = []
         self.max_num_running_reqs -= len(saved_running)
-
-        self.scheduler_config.long_prefill_token_threshold = 0
-        self.scheduler_config.enable_chunked_prefill = False
 
         scheduler_output = None
         try:
             scheduler_output = super().schedule()
         finally:
             self.max_num_running_reqs = saved_max_num_running_reqs
-            # 恢复父调度器的chunking参数
-            self.scheduler_config.long_prefill_token_threshold = (
-                saved_long_prefill_token_threshold
-            )
-            self.scheduler_config.enable_chunked_prefill = (
-                saved_enable_chunked_prefill
-            )
 
             if scheduler_output is not None:
                 if scheduler_output.total_num_scheduled_tokens == 0:
@@ -336,14 +310,6 @@ class PDSeparatedScheduler(Scheduler):
                 new_prefill_completed = [
                     req for req in self.running if not req.is_prefill_chunk
                 ]
-                # 防御性检查：PD分离下不应出现chunked prefill
-                if new_chunk_prefill_first:
-                    logger.warning(
-                        "[PD] %d request(s) still have is_prefill_chunk=True "
-                        "after disabling chunking limits. This should not "
-                        "happen and may indicate a bug or KV cache exhaustion.",
-                        len(new_chunk_prefill_first),
-                    )
                 for req in self.chunk_prefill_first:
                     if req not in new_chunk_prefill_first:
                         new_chunk_prefill_first.append(req)
@@ -638,10 +604,26 @@ class PDSeparatedScheduler(Scheduler):
                 if req.request_id not in completed_req_ids
             ]
             self.running.extend(newly_running)
+            # Chunked prefill requests that still have more chunks to process
+            # need to go back to chunk_prefill_first for the next chunk.
+            # They were removed from chunk_prefill_first by
+            # _pick_prefill_last_batch, and are not in prefill_last_pending
+            # (they go to chunk_prefill_first, not prefill_last_pending,
+            # in _pick_prefill_first_batch). Without this, chunked requests
+            # would be lost after their first PREFILL_LAST completes.
+            newly_chunked = []
+            for req_id in completed_req_ids:
+                req = self.requests.get(req_id)
+                if req and req.is_prefill_chunk and req not in self.chunk_prefill_first:
+                    self.chunk_prefill_first.append(req)
+                    newly_chunked.append(req)
             print(
                 f"[PD] update_from_output PREFILL_LAST done, "
                 f"prefill_inflight: {self.prefill_inflight_count}/{self.prefill_inflight_limit}, "
-                f"moved {len(newly_running)} reqs to running[], running[]: {len(self.running)}",
+                f"moved {len(newly_running)} reqs to running[], "
+                f"moved {len(newly_chunked)} reqs to chunk_prefill_first[], "
+                f"running[]: {len(self.running)}, "
+                f"chunk_prefill_first[]: {len(self.chunk_prefill_first)}",
                 flush=True,
             )
         if scheduler_output.batch_type == BatchType.DECODE_LAST:
