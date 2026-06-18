@@ -129,6 +129,15 @@ def _patched_engine_core_init(self, *args, **kwargs):
             "Edge-cloud mode enabled (pd_separation=%s)",
             pd_enabled,
         )
+        if getattr(parallel_config, "is_edge_node", False):
+            old_batch_queue_size = getattr(self, "batch_queue_size", None)
+            self.batch_queue_size = 3
+            logger.info(
+                "Edge-cloud edge node forces batch_queue_size=%d "
+                "(was %s)",
+                self.batch_queue_size,
+                old_batch_queue_size,
+            )
 
     # PP scheduler ZMQ publisher (pp rank0 → pp rank1 PassiveEngineCore).
     self._pp_scheduler_zmq_publisher = None
