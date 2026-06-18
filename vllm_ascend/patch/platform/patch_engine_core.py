@@ -224,10 +224,9 @@ def _drain_pd_channel_inbox(self) -> None:
                 set(),
             )
             if token and (token in pending or token in consumed):
-                pending.discard(token)
                 if token in released:
                     dropped.add(token)
-                else:
+                elif token in consumed:
                     consumed.discard(token)
                     dropped.discard(token)
                 logger.debug(
