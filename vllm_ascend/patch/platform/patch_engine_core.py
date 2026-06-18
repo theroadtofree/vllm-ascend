@@ -204,9 +204,23 @@ def _drain_pd_channel_inbox(self) -> None:
                 "local_decode_tail_consumed_tokens",
                 set(),
             )
+            released = getattr(
+                self.scheduler,
+                "local_decode_tail_released_tokens",
+                set(),
+            )
+            dropped = getattr(
+                self.scheduler,
+                "local_decode_tail_remote_dropped_tokens",
+                set(),
+            )
             if token and (token in pending or token in consumed):
                 pending.discard(token)
-                consumed.discard(token)
+                if token in released:
+                    dropped.add(token)
+                else:
+                    consumed.discard(token)
+                    dropped.discard(token)
                 logger.debug(
                     "Dropping duplicate remote DECODE_LAST for locally "
                     "synthesized decode tail, head_token=%s",

@@ -128,6 +128,8 @@ class PDSeparatedScheduler(Scheduler):
         self.local_decodes_last_ready: deque[SchedulerOutput] = deque()
         self.local_decode_tail_pending_tokens: set[str] = set()
         self.local_decode_tail_consumed_tokens: set[str] = set()
+        self.local_decode_tail_released_tokens: set[str] = set()
+        self.local_decode_tail_remote_dropped_tokens: set[str] = set()
 
         self._step_counter: int = 0
 
@@ -392,6 +394,10 @@ class PDSeparatedScheduler(Scheduler):
                 self.local_decode_tail_pending_tokens.discard(token)
                 if was_pending:
                     self.local_decode_tail_consumed_tokens.add(token)
+                    self.local_decode_tail_released_tokens.add(token)
+                    self.decode_inflight_count = max(
+                        0, self.decode_inflight_count - 1
+                    )
         elif self.decodes_last_ready:
             so = self.decodes_last_ready.popleft()
         else:
@@ -578,8 +584,17 @@ class PDSeparatedScheduler(Scheduler):
                 f"chunk_prefill_first[]: {len(self.chunk_prefill_first)}",
             )
         if scheduler_output.batch_type == BatchType.DECODE_LAST:
-            if self.decode_inflight_count > 0:
+            token = scheduler_output.head_token
+            released_early = bool(
+                token and token in self.local_decode_tail_released_tokens
+            )
+            if released_early:
+                self.local_decode_tail_released_tokens.discard(token)
+            elif self.decode_inflight_count > 0:
                 self.decode_inflight_count -= 1
+            if token and token in self.local_decode_tail_remote_dropped_tokens:
+                self.local_decode_tail_consumed_tokens.discard(token)
+                self.local_decode_tail_remote_dropped_tokens.discard(token)
             logger.info(
                 f"[PD] update_from_output DECODE_LAST done, "
                 f"decode_inflight: {self.decode_inflight_count}/{self.decode_inflight_limit}",
