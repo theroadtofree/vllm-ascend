@@ -3,6 +3,7 @@
 import enum
 import time
 from collections import deque
+from dataclasses import replace
 from collections.abc import Iterable
 from typing import Any
 from uuid import uuid4
@@ -121,6 +122,13 @@ class PDSeparatedScheduler(Scheduler):
         self.prefills_last_ready: deque[SchedulerOutput] = deque()
         self.decodes_last_ready: deque[SchedulerOutput] = deque()
 
+        # Locally synthesized D-tail batches. If no P-first work can cover the
+        # cloud D-middle latency, the edge can dispatch D-tail immediately and
+        # block on the data-plane recv instead of scheduler-idling for POST_OUT.
+        self.local_decodes_last_ready: deque[SchedulerOutput] = deque()
+        self.local_decode_tail_pending_tokens: set[str] = set()
+        self.local_decode_tail_consumed_tokens: set[str] = set()
+
         self._step_counter: int = 0
 
         # In-flight prefill limit (head-segment batches).
@@ -163,7 +171,7 @@ class PDSeparatedScheduler(Scheduler):
 
     def _pick_by_state(self, state: PrefillState) -> SchedulerOutput:
         if state == PrefillState.IDLE:
-            # IDLE: P首/chunk0首 > D首 > D尾 > Empty.
+            # IDLE: P首/chunk0首 > D尾 > D首 > Empty.
             if self._can_schedule_prefill_first():
                 so = self._pick_prefill_first_batch()
                 if so.total_num_scheduled_tokens > 0:
@@ -177,14 +185,14 @@ class PDSeparatedScheduler(Scheduler):
                     "requests. Prefill work will be deferred until resources are freed."
                 )
                 self.finished_req_ids.update(so.finished_req_ids)
+            if self._has_decode_last_work():
+                return self._pick_decode_last_batch()
             if self._can_schedule_decode_first():
                 return self._pick_decode_first_batch()
-            if self.decodes_last_ready:
-                return self._pick_decode_last_batch()
             return self._make_empty_batch()
 
         if state == PrefillState.LOW:
-            # LOW: chunk/P首(when slot available) > P尾 > D首 > D尾 > Empty.
+            # LOW: chunk/P首(when slot available) > P尾 > D尾 > D首 > Empty.
             if self._can_schedule_prefill_first():
                 so = self._pick_prefill_first_batch()
                 if so.total_num_scheduled_tokens > 0:
@@ -197,19 +205,19 @@ class PDSeparatedScheduler(Scheduler):
                 self.finished_req_ids.update(so.finished_req_ids)
             if self.prefills_last_ready:
                 return self._pick_prefill_last_batch()
+            if self._has_decode_last_work():
+                return self._pick_decode_last_batch()
             if self._can_schedule_decode_first():
                 return self._pick_decode_first_batch()
-            if self.decodes_last_ready:
-                return self._pick_decode_last_batch()
             return self._make_empty_batch()
 
-        # HIGH: P尾 > D首 > D尾 > Empty. New P首 is forbidden.
+        # HIGH: P尾 > D尾 > D首 > Empty. New P首 is forbidden.
         if self.prefills_last_ready:
             return self._pick_prefill_last_batch()
+        if self._has_decode_last_work():
+            return self._pick_decode_last_batch()
         if self._can_schedule_decode_first():
             return self._pick_decode_first_batch()
-        if self.decodes_last_ready:
-            return self._pick_decode_last_batch()
         return self._make_empty_batch()
 
     def is_waiting_for_remote_tail(self) -> bool:
@@ -222,7 +230,7 @@ class PDSeparatedScheduler(Scheduler):
         return bool(
             (self.prefill_inflight_count > 0 or self.decode_inflight_count > 0)
             and not self.prefills_last_ready
-            and not self.decodes_last_ready
+            and not self._has_decode_last_work()
             and not self._can_schedule_prefill_first()
             and not self._can_schedule_decode_first()
         )
@@ -239,6 +247,9 @@ class PDSeparatedScheduler(Scheduler):
 
     def _has_prefill_work(self) -> bool:
         return bool(self.chunk_prefill_first or self.waiting)
+
+    def _has_decode_last_work(self) -> bool:
+        return bool(self.local_decodes_last_ready or self.decodes_last_ready)
 
     def _can_schedule_prefill_first(self) -> bool:
         # When running decode requests already fill max_num_running_reqs,
@@ -268,6 +279,7 @@ class PDSeparatedScheduler(Scheduler):
             f"prefill_last_pending[]: {len(self.prefill_last_pending)}, "
             f"running[]: {len(self.running)}, "
             f"prefills_last_ready[]: {len(self.prefills_last_ready)}, "
+            f"local_decodes_last_ready[]: {len(self.local_decodes_last_ready)}, "
             f"decodes_last_ready[]: {len(self.decodes_last_ready)}, "
             f"prefill_inflight: {self.prefill_inflight_count}/{self.prefill_inflight_limit}, "
             f"decode_inflight: {self.decode_inflight_count}/{self.decode_inflight_limit}",
@@ -372,9 +384,18 @@ class PDSeparatedScheduler(Scheduler):
             )
 
     def _pick_decode_last_batch(self) -> SchedulerOutput:
-        if not self.decodes_last_ready:
+        if self.local_decodes_last_ready:
+            so = self.local_decodes_last_ready.popleft()
+            token = so.head_token
+            if token:
+                was_pending = token in self.local_decode_tail_pending_tokens
+                self.local_decode_tail_pending_tokens.discard(token)
+                if was_pending:
+                    self.local_decode_tail_consumed_tokens.add(token)
+        elif self.decodes_last_ready:
+            so = self.decodes_last_ready.popleft()
+        else:
             return self._make_empty_batch()
-        so = self.decodes_last_ready.popleft()
         assert so.batch_type == BatchType.DECODE_LAST, (
             f"decodes_last_ready expects DECODE_LAST, got {so.batch_type}"
         )
@@ -450,6 +471,15 @@ class PDSeparatedScheduler(Scheduler):
                     )
                     self._ensure_cached_all_token_ids(scheduler_output)
                     self.decode_inflight_count += 1
+                    decode_last = replace(
+                        scheduler_output,
+                        batch_type=BatchType.DECODE_LAST,
+                    )
+                    self.local_decodes_last_ready.append(decode_last)
+                    if scheduler_output.head_token:
+                        self.local_decode_tail_pending_tokens.add(
+                            scheduler_output.head_token
+                        )
                 for req in list(self.waiting):
                     saved_waiting.prepend_request(req)
                 self.chunk_prefill_first = saved_chunk_prefill_first

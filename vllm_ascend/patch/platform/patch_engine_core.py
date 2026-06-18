@@ -193,6 +193,26 @@ def _drain_pd_channel_inbox(self) -> None:
         if bt == BatchType.PREFILL_LAST:
             self.scheduler.prefills_last_ready.append(so)
         elif bt == BatchType.DECODE_LAST:
+            token = getattr(so, "head_token", None)
+            pending = getattr(
+                self.scheduler,
+                "local_decode_tail_pending_tokens",
+                set(),
+            )
+            consumed = getattr(
+                self.scheduler,
+                "local_decode_tail_consumed_tokens",
+                set(),
+            )
+            if token and (token in pending or token in consumed):
+                pending.discard(token)
+                consumed.discard(token)
+                logger.debug(
+                    "Dropping duplicate remote DECODE_LAST for locally "
+                    "synthesized decode tail, head_token=%s",
+                    token,
+                )
+                continue
             self.scheduler.decodes_last_ready.append(so)
         else:
             logger.error(
