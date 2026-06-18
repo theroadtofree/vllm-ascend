@@ -443,6 +443,291 @@ class GroupCoordinatorPatch(GroupCoordinator):
                 tensor_dict[key] = value
         return tensor_dict, handles, []
 
+    # ------------------------------------------------------------------
+    # Dual-channel (alternate group) overrides
+    #
+    # Upstream vllm/distributed/parallel_state.py is kept clean. The
+    # following methods replicate the upstream behavior bit-for-bit when
+    # use_alt_group=False, and route through self.alt_*_group when
+    # use_alt_group=True. Required by vllm_ascend/worker/worker.py to
+    # separate ALL_DECODE traffic from the rest of PP traffic.
+    #
+    # Additionally, isend_tensor_dict here adds the NPU `record_stream`
+    # branch so the upstream parallel_state.py does not need a device
+    # check for "npu".
+    # ------------------------------------------------------------------
+
+    def send_object(self, obj: Any, dst: int, use_alt_group: bool = False) -> None:
+        """Send the input object list to the destination rank.
+
+        NOTE: ``dst`` is the local rank of the destination rank.
+        """
+        assert dst < self.world_size, f"Invalid dst rank ({dst})"
+        assert dst != self.rank_in_group, (
+            "Invalid destination rank. Destination rank is the same as the current rank."
+        )
+
+        cpu_group = self.alt_cpu_group if use_alt_group else self.cpu_group
+
+        # Serialize object to tensor and get the size as well
+        object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
+        size_tensor = torch.tensor(
+            [object_tensor.numel()], dtype=torch.long, device="cpu"
+        )
+
+        # Send object size
+        torch.distributed.send(size_tensor, dst=self.ranks[dst], group=cpu_group)
+        # Send object
+        torch.distributed.send(object_tensor, dst=self.ranks[dst], group=cpu_group)
+        return None
+
+    def recv_object(self, src: int, use_alt_group: bool = False) -> Any:
+        """Receive the input object list from the source rank.
+
+        NOTE: ``src`` is the local rank of the source rank.
+        """
+        assert src < self.world_size, f"Invalid src rank ({src})"
+        assert src != self.rank_in_group, (
+            "Invalid source rank. Source rank is the same as the current rank."
+        )
+
+        cpu_group = self.alt_cpu_group if use_alt_group else self.cpu_group
+
+        size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
+        # Receive object size
+        rank_size = torch.distributed.recv(
+            size_tensor, src=self.ranks[src], group=cpu_group
+        )
+
+        # Tensor to receive serialized objects into.
+        object_tensor = torch.empty(  # type: ignore[call-overload]
+            size_tensor.item(),  # type: ignore[arg-type]
+            dtype=torch.uint8,
+            device="cpu",
+        )
+        rank_object = torch.distributed.recv(
+            object_tensor, src=self.ranks[src], group=cpu_group
+        )
+
+        assert rank_object == rank_size, (
+            "Received object sender rank does not match the size sender rank."
+        )
+        return pickle.loads(object_tensor.numpy().tobytes())
+
+    def send_tensor_dict(
+        self,
+        tensor_dict: dict[str, torch.Tensor | Any],
+        dst: int | None = None,
+        all_gather_group: "GroupCoordinator | None" = None,
+        all_gather_tensors: dict[str, bool] | None = None,
+        use_alt_group: bool = False,
+    ) -> dict[str, torch.Tensor | Any] | None:
+        """Synchronous tensor-dict send. See upstream docstring for semantics.
+
+        ``use_alt_group``: If True, use the alternate device/cpu groups for
+        communication. Requires ``create_alternate_groups`` to have been
+        called first.
+        """
+        # Bypass the function if we are using only 1 GPU.
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return tensor_dict
+        handles = self.isend_tensor_dict(
+            tensor_dict,
+            dst=dst,
+            all_gather_group=all_gather_group,
+            all_gather_tensors=all_gather_tensors,
+            use_alt_group=use_alt_group,
+        )
+        for handle in handles:
+            handle.wait()
+        return None
+
+    def isend_tensor_dict(
+        self,
+        tensor_dict: dict[str, torch.Tensor | Any],
+        dst: int | None = None,
+        all_gather_group: "GroupCoordinator | None" = None,
+        all_gather_tensors: dict[str, bool] | None = None,
+        use_alt_group: bool = False,
+    ):
+        """Async tensor-dict send. Returns the list of distributed handles."""
+        if self.world_size <= 1:
+            return []
+
+        if dst is None:
+            dst = (self.rank_in_group + 1) % self.world_size
+        assert dst < self.world_size, f"Invalid dst rank ({dst})"
+
+        if self.use_cpu_custom_send_recv:
+            if self.device_communicator is None:
+                raise ValueError("No device communicator found")
+            # custom device communicator path is synchronous
+            self.device_communicator.send_tensor_dict(  # type: ignore
+                tensor_dict, dst
+            )
+            return []
+
+        all_gather_size = (
+            1 if all_gather_group is None else all_gather_group.world_size
+        )
+        all_gather_rank = (
+            0 if all_gather_group is None else all_gather_group.rank_in_group
+        )
+
+        if use_alt_group:
+            assert self.alt_device_group is not None, (
+                "Alternate groups not created. "
+                "Call create_alternate_groups() first."
+            )
+            group = self.alt_device_group
+            metadata_group = self.alt_cpu_group
+        else:
+            group = self.device_group
+            metadata_group = self.cpu_group
+
+        metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+        self.send_object(metadata_list, dst=dst, use_alt_group=use_alt_group)
+
+        tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
+        assert len(tensor_keys) == len(tensor_list)
+
+        handles = []
+        for key, tensor in zip(tensor_keys, tensor_list):
+            if tensor.numel() == 0:
+                continue
+
+            if self._should_use_all_gather(
+                key, tensor.numel(), all_gather_group, all_gather_tensors
+            ):
+                tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+
+            comm_group = metadata_group if tensor.is_cpu else group
+            handle = torch.distributed.isend(
+                tensor, dst=self.ranks[dst], group=comm_group
+            )
+            # NPU record_stream branch — moved here from upstream parallel_state.py.
+            if tensor.is_cuda:
+                tensor.record_stream(torch.cuda.current_stream(tensor.device))
+            elif tensor.device.type == "npu":
+                tensor.record_stream(torch.npu.current_stream(tensor.device))
+            handles.append(handle)
+        return handles
+
+    def recv_tensor_dict(
+        self,
+        src: int | None = None,
+        all_gather_group: "GroupCoordinator | None" = None,
+        all_gather_tensors: dict[str, bool] | None = None,
+        use_alt_group: bool = False,
+    ) -> dict[str, torch.Tensor | Any] | None:
+        """Synchronous tensor-dict recv. See upstream docstring for semantics."""
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return None
+        tensor_dict, handles, postprocess = self.irecv_tensor_dict(
+            src=src,
+            all_gather_group=all_gather_group,
+            all_gather_tensors=all_gather_tensors,
+            use_alt_group=use_alt_group,
+        )
+        for handle in handles:
+            handle.wait()
+        for fn in postprocess:
+            fn()
+        return tensor_dict
+
+    def irecv_tensor_dict(
+        self,
+        src: int | None = None,
+        all_gather_group: "GroupCoordinator | None" = None,
+        all_gather_tensors: dict[str, bool] | None = None,
+        use_alt_group: bool = False,
+    ):
+        """Async tensor-dict recv. Returns ``(tensor_dict, handles, postprocess)``."""
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return None, [], []
+
+        if src is None:
+            src = (self.rank_in_group - 1) % self.world_size
+        assert src < self.world_size, f"Invalid src rank ({src})"
+
+        if self.use_cpu_custom_send_recv:
+            if self.device_communicator is None:
+                raise ValueError("No device communicator found")
+            # custom device communicator path is synchronous
+            sync_tensor_dict = self.device_communicator.recv_tensor_dict(  # type: ignore
+                src
+            )
+            return sync_tensor_dict, [], []
+
+        all_gather_size = (
+            1 if all_gather_group is None else all_gather_group.world_size
+        )
+        all_gather_rank = (
+            0 if all_gather_group is None else all_gather_group.rank_in_group
+        )
+
+        if use_alt_group:
+            assert self.alt_device_group is not None, (
+                "Alternate groups not created. "
+                "Call create_alternate_groups() first."
+            )
+            group = self.alt_device_group
+            metadata_group = self.alt_cpu_group
+        else:
+            group = self.device_group
+            metadata_group = self.cpu_group
+
+        recv_metadata_list = self.recv_object(src=src, use_alt_group=use_alt_group)
+        tensor_dict: dict[str, Any] = {}
+        handles: list[Any] = []
+        postprocess: list[Callable[[], None]] = []
+
+        for key, value in recv_metadata_list:
+            if isinstance(value, TensorMetadata):
+                full_tensor = torch.empty(
+                    value.size, dtype=value.dtype, device=value.device
+                )
+                if full_tensor.numel() == 0:
+                    tensor_dict[key] = full_tensor
+                    continue
+
+                if self._should_use_all_gather(
+                    key, full_tensor.numel(), all_gather_group, all_gather_tensors
+                ):
+                    orig_shape = full_tensor.shape
+                    slice_tensor = full_tensor.reshape(all_gather_size, -1)[
+                        all_gather_rank
+                    ]
+                    comm_group = metadata_group if slice_tensor.is_cpu else group
+                    handle = torch.distributed.irecv(
+                        slice_tensor, src=self.ranks[src], group=comm_group
+                    )
+                    handles.append(handle)
+
+                    def _postprocess(
+                        key: str = key,
+                        slice_tensor: torch.Tensor = slice_tensor,
+                        orig_shape: tuple[int, ...] = tuple(orig_shape),
+                        all_gather_group=all_gather_group,
+                    ) -> None:
+                        assert all_gather_group is not None
+                        tensor_dict[key] = all_gather_group.all_gather(
+                            slice_tensor, dim=0
+                        ).reshape(orig_shape)
+
+                    postprocess.append(_postprocess)
+                    tensor_dict[key] = slice_tensor
+                else:
+                    comm_group = metadata_group if full_tensor.is_cpu else group
+                    handle = torch.distributed.irecv(
+                        full_tensor, src=self.ranks[src], group=comm_group
+                    )
+                    handles.append(handle)
+                    tensor_dict[key] = full_tensor
+            else:
+                tensor_dict[key] = value
+        return tensor_dict, handles, postprocess
+
     def all_to_all(
         self,
         input_: torch.Tensor,

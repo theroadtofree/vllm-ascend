@@ -7,19 +7,26 @@ import pytest
 from vllm_ascend.scheduler_conflicts import validate_pd_separation_scheduler_conflicts
 
 
-def _vllm_config(enable_pd_separation=True):
-    return SimpleNamespace(
-        scheduler_config=SimpleNamespace(enable_pd_separation=enable_pd_separation),
-    )
+def _vllm_config():
+    # scheduler_config no longer carries enable_pd_separation; the flag now
+    # lives under additional_config.edge_cloud_config.pd_separation.
+    return SimpleNamespace(scheduler_config=SimpleNamespace())
 
 
 def _ascend_config(
     *,
-    recompute_scheduler_enable=False,
-    slo_limits_for_dynamic_batch=-1,
-    profiling_chunk_enabled=False,
+    pd_separation_enabled: bool = True,
+    edge_cloud_enabled: bool = True,
+    recompute_scheduler_enable: bool = False,
+    slo_limits_for_dynamic_batch: int = -1,
+    profiling_chunk_enabled: bool = False,
 ):
+    edge_cloud = SimpleNamespace(
+        enabled=edge_cloud_enabled,
+        pd_separation=SimpleNamespace(enabled=pd_separation_enabled),
+    )
     return SimpleNamespace(
+        edge_cloud_config=edge_cloud,
         recompute_scheduler_enable=recompute_scheduler_enable,
         SLO_limits_for_dynamic_batch=slo_limits_for_dynamic_batch,
         profiling_chunk_config=SimpleNamespace(enabled=profiling_chunk_enabled),
@@ -57,8 +64,21 @@ def test_pd_separation_allows_default_ascend_scheduler_config():
 
 def test_scheduler_conflict_check_is_noop_when_pd_separation_disabled():
     validate_pd_separation_scheduler_conflicts(
-        _vllm_config(enable_pd_separation=False),
+        _vllm_config(),
         _ascend_config(
+            pd_separation_enabled=False,
+            recompute_scheduler_enable=True,
+            slo_limits_for_dynamic_batch=100,
+            profiling_chunk_enabled=True,
+        ),
+    )
+
+
+def test_scheduler_conflict_check_is_noop_when_edge_cloud_disabled():
+    validate_pd_separation_scheduler_conflicts(
+        _vllm_config(),
+        _ascend_config(
+            edge_cloud_enabled=False,
             recompute_scheduler_enable=True,
             slo_limits_for_dynamic_batch=100,
             profiling_chunk_enabled=True,

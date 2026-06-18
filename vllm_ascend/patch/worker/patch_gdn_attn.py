@@ -515,8 +515,20 @@ def _build_non_spec_causal_conv1d_host_meta(
         None if slot is None else slot.has_initial_state_cpu,
     )
 
+    # Clone query_start_loc_cpu to decouple it from the shared
+    # common_attn_metadata.query_start_loc_cpu buffer.  In edge-cloud
+    # layer-sliced inference, a decode batch can be interleaved between
+    # two prefill slices; the decode rebuilds common_attn_metadata and
+    # overwrites the shared buffer in-place.  Without cloning, the
+    # cached _layerwise_attn_metadata would see the decode's values
+    # (e.g. queryStartLoc[last]=2 for 2 decode tokens) instead of the
+    # original prefill values (e.g. 2048 prefill tokens), causing
+    # aclnnCausalConv1d tiling validation failure (EZ9999:
+    # "queryStartLoc[last] must equal cuSeqlen").
+    query_start_loc_cpu = non_spec_query_start_loc_cpu.clone()
+
     return GDNCausalConv1dHostMetadata(
-        query_start_loc_cpu=non_spec_query_start_loc_cpu,
+        query_start_loc_cpu=query_start_loc_cpu,
         cache_indices_cpu=cache_indices_cpu,
         has_initial_state_cpu=has_initial_state_cpu,
         _buffer_slot=slot,

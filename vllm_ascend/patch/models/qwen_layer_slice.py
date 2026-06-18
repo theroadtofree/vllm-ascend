@@ -31,7 +31,7 @@
 #   This patch keeps upstream vLLM untouched and re-binds those forward
 #   methods at runtime.  It is loaded on demand from
 #   `vllm_ascend/worker/model_runner_v1.py` only when the layer-slice
-#   feature is actually enabled (envs.VLLM_LAYER_SLICE_SIZE > 0).
+#   feature is actually enabled (layer-slice YAML config is present).
 #
 #   - `Qwen3Model` extends `Qwen2Model`, so patching `Qwen2Model.forward`
 #     transparently covers Qwen3 dense models as well.

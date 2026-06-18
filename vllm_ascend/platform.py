@@ -274,10 +274,22 @@ class NPUPlatform(Platform):
             raise ValueError("additional_config.layer_sharding can only be enabled in PD-disaggregated's P node.")
 
     @classmethod
-    def _configure_pd_separation_scheduler(cls, vllm_config: VllmConfig) -> None:
-        scheduler_config = getattr(vllm_config, "scheduler_config", None)
-        if not getattr(scheduler_config, "enable_pd_separation", False):
+    def _configure_pd_separation_scheduler(
+        cls, vllm_config: VllmConfig, ascend_config
+    ) -> None:
+        edge_cloud = getattr(ascend_config, "edge_cloud_config", None)
+        if edge_cloud is None or not getattr(edge_cloud, "enabled", False):
             return
+        pd = getattr(edge_cloud, "pd_separation", None)
+        if pd is None or not getattr(pd, "enabled", False):
+            return
+
+        scheduler_config = vllm_config.scheduler_config
+        # The integer ``prefill_inflight_limit`` is the legacy field consumed
+        # by ``PDSeparatedScheduler``; back-fill it from the bool-flavoured
+        # user config so the scheduler's reader stays unchanged.
+        scheduler_config.pd_prefill_inflight_limit = pd.prefill_inflight_limit
+
         if getattr(scheduler_config, "async_scheduling", False):
             scheduler_config.scheduler_cls = (
                 "vllm_ascend.core.pd_separated_scheduler.AsyncPDSeparatedScheduler"
@@ -304,7 +316,7 @@ class NPUPlatform(Platform):
         from vllm_ascend.scheduler_conflicts import validate_pd_separation_scheduler_conflicts
 
         validate_pd_separation_scheduler_conflicts(vllm_config, ascend_config)
-        cls._configure_pd_separation_scheduler(vllm_config)
+        cls._configure_pd_separation_scheduler(vllm_config, ascend_config)
 
         if vllm_config.kv_transfer_config is not None:
             check_kv_extra_config(vllm_config)

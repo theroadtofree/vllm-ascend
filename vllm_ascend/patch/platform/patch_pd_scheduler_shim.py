@@ -35,4 +35,42 @@ def install_ascend_pd_scheduler_shims() -> None:
     sys.modules["vllm.v1.core.sched.pd_separated_scheduler"] = pd_separated_scheduler
 
 
+def install_ascend_passive_engine_core_shims() -> None:
+    """Re-expose vllm-ascend PassiveEngineCore + ZMQ channel classes on the
+    legacy ``vllm.v1.engine.core`` module path.
+
+    vllm-pdmix's downstream fork used to ship four classes inside
+    ``vllm/v1/engine/core.py``:
+    ``PassiveEngineCoreProc`` / ``PPSchedulerZmqPublisher`` /
+    ``PPSchedulerZmqSubscriber`` / ``PPSchedulerZmqChannel``. The migration
+    moves them to :mod:`vllm_ascend.v1.engine.passive_core`. To keep any
+    callsite that still does ``from vllm.v1.engine.core import
+    PassiveEngineCoreProc`` working, attach them as attributes on the
+    upstream module. This is purely additive — upstream attributes are
+    untouched.
+    """
+    try:
+        import vllm.v1.engine.core as upstream_core
+        from vllm_ascend.v1.engine.passive_core import (
+            PassiveEngineCoreProc,
+            PPSchedulerZmqChannel,
+            PPSchedulerZmqPublisher,
+            PPSchedulerZmqSubscriber,
+        )
+    except ImportError:
+        return
+
+    for name, obj in (
+        ("PassiveEngineCoreProc", PassiveEngineCoreProc),
+        ("PPSchedulerZmqPublisher", PPSchedulerZmqPublisher),
+        ("PPSchedulerZmqSubscriber", PPSchedulerZmqSubscriber),
+        ("PPSchedulerZmqChannel", PPSchedulerZmqChannel),
+    ):
+        # Only set if upstream does not already export the symbol — a
+        # later upstream that lands these natively must take priority.
+        if not hasattr(upstream_core, name):
+            setattr(upstream_core, name, obj)
+
+
 install_ascend_pd_scheduler_shims()
+install_ascend_passive_engine_core_shims()

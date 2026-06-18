@@ -18,7 +18,7 @@
 #
 
 import math
-from vllm import envs
+import os
 import sys
 import time
 from collections import defaultdict
@@ -326,6 +326,84 @@ class HeadState:
     head_token: str
     scheduler_output: "SchedulerOutput"
     req_ids: tuple[str, ...]
+
+
+def _clone_gdn_attn_metadata(meta):
+    """Deep-clone device tensors inside GDNAttentionMetadata.
+
+    GDN metadata holds device tensors that are views into shared
+    ``common_attn_metadata`` buffers (e.g. ``query_start_loc``,
+    ``state_indices``).  These buffers are rebuilt on every batch, so a
+    decode batch interleaved between two prefill slices would silently
+    overwrite the data still referenced by the saved
+    ``_layerwise_attn_metadata``.  Cloning at **save time** preserves
+    the correct prefill-length values.
+    """
+    import copy
+    from dataclasses import fields
+
+    # Use dataclass replacement to create a shallow copy first,
+    # then deep-clone the device tensor fields.
+    cloned = copy.copy(meta)
+
+    # Device tensor fields that must be cloned to decouple from
+    # shared common_attn_metadata buffers.
+    _DEVICE_TENSOR_FIELDS = (
+        "has_initial_state",
+        "spec_query_start_loc",
+        "non_spec_query_start_loc",
+        "spec_state_indices_tensor",
+        "non_spec_state_indices_tensor",
+        "spec_sequence_masks",
+        "spec_token_indx",
+        "non_spec_token_indx",
+        "num_accepted_tokens",
+        "chunk_indices",
+        "chunk_offsets",
+    )
+    for field_name in _DEVICE_TENSOR_FIELDS:
+        tensor = getattr(cloned, field_name, None)
+        if tensor is not None and isinstance(tensor, torch.Tensor) and tensor.device.type != "cpu":
+            setattr(cloned, field_name, tensor.clone())
+
+    # The non_spec_prefill_fallback_meta contains pooled device tensors
+    # for causal_conv1d host args and chunked prefill metadata.
+    fallback_meta = getattr(cloned, "non_spec_prefill_fallback_meta", None)
+    if fallback_meta is not None:
+        cloned_fallback = copy.copy(fallback_meta)
+
+        # Clone causal_conv1d host metadata (CPU pinned tensors)
+        causal_conv1d = getattr(cloned_fallback, "causal_conv1d", None)
+        if causal_conv1d is not None:
+            cloned_causal = copy.copy(causal_conv1d)
+            for attr in ("query_start_loc_cpu", "cache_indices_cpu", "has_initial_state_cpu"):
+                t = getattr(cloned_causal, attr, None)
+                if t is not None and isinstance(t, torch.Tensor):
+                    setattr(cloned_causal, attr, t.clone())
+            cloned_fallback.causal_conv1d = cloned_causal
+
+        # Clone chunked prefill metadata (device tensors from 2-slot pool)
+        chunk_meta = getattr(cloned_fallback, "chunk", None)
+        if chunk_meta is not None:
+            cloned_chunk = copy.copy(chunk_meta)
+            for attr in (
+                "chunk_indices_chunk64",
+                "chunk_offsets_chunk64",
+                "update_chunk_offsets_chunk64",
+                "final_chunk_indices_chunk64",
+                "chunk_indices_large_block",
+                "block_indices_cumsum",
+            ):
+                t = getattr(cloned_chunk, attr, None)
+                if t is not None and isinstance(t, torch.Tensor) and t.device.type != "cpu":
+                    setattr(cloned_chunk, attr, t.clone())
+            # Decouple from pool so the pool slot can be reused safely
+            cloned_chunk._buffer_slot = None
+            cloned_fallback.chunk = cloned_chunk
+
+        cloned.non_spec_prefill_fallback_meta = cloned_fallback
+
+    return cloned
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -2159,7 +2237,7 @@ class NPUModelRunner(GPUModelRunner):
                 # captured full CUDAGraph.
                 if (
                     not get_pp_group().is_first_rank
-                    and envs.VLLM_LAYER_SLICE_SIZE > 0
+                    and getattr(self, "_layer_slice_enabled", False)
                     and cudagraph_mode == CUDAGraphMode.FULL
                 ):
                     cudagraph_mode = CUDAGraphMode.NONE
@@ -2289,7 +2367,22 @@ class NPUModelRunner(GPUModelRunner):
         # Save per-step state for layer slice continuation.
         if layer_slice_info is not None and not layer_slice_info.is_last_slice:
             self._layerwise_positions = positions
-            self._layerwise_attn_metadata = attn_metadata
+            # Deep-clone device tensors inside attn_metadata to prevent
+            # corruption by subsequent decode batches.  The metadata's
+            # device tensors (query_start_loc, state_indices, etc.) are
+            # views into shared common_attn_metadata buffers that get
+            # rebuilt on every batch.  If a decode batch runs between
+            # two prefill slices, it overwrites these buffers in-place,
+            # corrupting the saved metadata.  Cloning at save time
+            # preserves the correct prefill values.
+            if isinstance(attn_metadata, dict):
+                self._layerwise_attn_metadata = {
+                    k: _clone_gdn_attn_metadata(v) for k, v in attn_metadata.items()
+                }
+            elif attn_metadata is not None:
+                self._layerwise_attn_metadata = _clone_gdn_attn_metadata(attn_metadata)
+            else:
+                self._layerwise_attn_metadata = attn_metadata
             self._layerwise_num_tokens_padded = num_tokens_padded
             self._layerwise_num_tokens_across_dp = num_tokens_across_dp
             self._layerwise_batch_desc = batch_desc
@@ -3301,6 +3394,17 @@ class NPUModelRunner(GPUModelRunner):
         # Re-use the positions and attention metadata that slice 0 prepared.
         positions = self._layerwise_positions
         attn_metadata = self._layerwise_attn_metadata
+
+        # Mark the attention metadata as a layer-slice continuation so that
+        # GDN's causal_conv1d prefill path knows conv_state may have been
+        # polluted by an interleaved decode batch.  See
+        # vllm_ascend.ops.gdn._maybe_reset_initial_state_for_layer_slice.
+        if isinstance(attn_metadata, dict):
+            for per_layer_meta in attn_metadata.values():
+                per_layer_meta._is_layer_slice_continuation = True
+        elif attn_metadata is not None:
+            attn_metadata._is_layer_slice_continuation = True
+
         num_tokens_padded = self._layerwise_num_tokens_padded
         num_tokens_across_dp = self._layerwise_num_tokens_across_dp
         batch_desc = self._layerwise_batch_desc
@@ -4487,7 +4591,10 @@ class NPUModelRunner(GPUModelRunner):
         # rebound forward is what the loaded modules actually expose.
         # Loaded on demand to keep upstream vLLM unmodified for users that
         # don't enable this feature.
-        if envs.VLLM_LAYER_SLICE_SIZE > 0:
+        self._layer_slice_enabled = os.path.exists(
+            os.environ.get("VLLM_LAYER_SLICE_CONFIG", "layer_slice_config.yaml")
+        )
+        if self._layer_slice_enabled:
             import vllm_ascend.patch.models.qwen_layer_slice  # noqa: F401
 
         if self._edge_cloud_enabled:

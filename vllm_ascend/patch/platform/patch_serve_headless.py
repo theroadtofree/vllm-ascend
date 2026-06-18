@@ -35,6 +35,14 @@ def _install_ascend_passive_scheduler_shim() -> None:
 
 def _run_passive_engine_core_with_ascend_shims(**kwargs):
     _install_ascend_passive_scheduler_shim()
+    # Re-attach PassiveEngineCoreProc + ZMQ classes to the upstream
+    # ``vllm.v1.engine.core`` module path so the legacy import below
+    # resolves even when this code runs in a freshly-spawned subprocess
+    # (no ascend platform __init__ side-effects guaranteed yet).
+    from vllm_ascend.patch.platform.patch_pd_scheduler_shim import (
+        install_ascend_passive_engine_core_shims,
+    )
+    install_ascend_passive_engine_core_shims()
 
     from vllm.v1.engine.core import PassiveEngineCoreProc
 

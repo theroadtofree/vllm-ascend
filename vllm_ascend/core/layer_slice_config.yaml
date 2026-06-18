@@ -1,0 +1,28 @@
+# Layer-slice dynamic configuration for cloud-side PassiveScheduler.
+#
+# Format:
+#   <token_threshold_k>: <total_slice_count>
+#
+# The key is the prefill batch size in *thousands* of tokens.
+# The value is the total number of layer slices for that batch.
+#
+# Matching rule (largest-threshold-first):
+#   total_num_scheduled_tokens >= key * 1000  ->  use value
+#
+# Example: a 62-layer model (after removing head/tail) with the config below:
+#   - 16k tokens -> 5 slices -> ~13 layers per slice
+#   - 8k  tokens -> 4 slices -> ~15 layers per slice
+#   - 4k  tokens -> 3 slices -> ~20 layers per slice
+#   - 1k  tokens -> 2 slices -> ~31 layers per slice
+#   - <1k tokens -> 1 slice  -> full 62 layers at once
+#
+# This file supports hot-reload: modify and save while the service is
+# running; the next prefill batch will pick up the new config automatically.
+
+16: 24
+8: 10
+4: 4
+3: 6
+2: 5
+1: 5
+0: 5

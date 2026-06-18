@@ -61,6 +61,42 @@ def get_non_spec_causal_conv1d_host_args(attn_metadata) -> tuple[tuple[int, ...]
     )
 
 
+def _maybe_reset_initial_state_for_layer_slice(
+    attn_metadata: GDNAttentionMetadata,
+    initial_state_mode_opt: tuple[int, ...],
+) -> tuple[int, ...]:
+    """Reset initial_state_mode to all-zeros when conv_state may be polluted.
+
+    In edge-cloud layer-sliced inference, a decode batch can be interleaved
+    between two prefill slices.  The decode path (causal_conv1d_update_npu)
+    writes conv_state in-place using a sliding-window format that differs
+    from the format expected by npu_causal_conv1d_custom's InitRing (FN
+    mode).  When the same conv_state slots are reused across requests, the
+    prefill request's slots may contain stale data left by a prior decode,
+    causing aclnnCausalConv1d EZ9999 if has_initial_state=True.
+
+    We detect the layer-sliced continuation scenario via the
+    ``_is_layer_slice_continuation`` flag that PassiveScheduler /
+    model_runner sets on the attention metadata before dispatching a
+    non-first prefill slice.  In that case we force initial_state_mode to
+    all-zeros so the CANN kernel initialises the ring buffer from scratch
+    rather than reading potentially-polluted conv_state data.
+
+    This is safe because: in a layer-sliced prefill, each GDN layer in a
+    non-first slice has never processed the current request before, so its
+    conv_state for the current request's slots genuinely has no valid
+    initial state — even though the request-level context_lens > 0 may
+    suggest otherwise.
+    """
+    if not getattr(attn_metadata, "_is_layer_slice_continuation", False):
+        return initial_state_mode_opt
+
+    # Force all entries to 0: no sequence should read initial state from
+    # conv_state in a layer-slice continuation, because this layer has
+    # never seen this request before.
+    return tuple(0 for _ in initial_state_mode_opt)
+
+
 def get_non_spec_chunked_prefill_meta(attn_metadata):
     fallback_meta = _require_non_spec_prefill_fallback_meta(attn_metadata, "chunk")
     return fallback_meta.chunk
@@ -177,6 +213,16 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         attn_metadata = attn_metadata[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
         has_initial_state = attn_metadata.has_initial_state
+        # Edge-cloud layer-sliced inference: when this is a non-first slice
+        # continuation, conv_state and ssm_state for this layer have never
+        # been populated by the current request.  Force has_initial_state
+        # to an all-False tensor so that both the causal_conv1d and
+        # recurrent attention kernels start from a clean zero state instead
+        # of reading stale data left by a prior decode that was interleaved
+        # between slices.
+        if getattr(attn_metadata, "_is_layer_slice_continuation", False):
+            if has_initial_state is not None:
+                has_initial_state = torch.zeros_like(has_initial_state)
         spec_query_start_loc = attn_metadata.spec_query_start_loc
         non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
         spec_sequence_masks = attn_metadata.spec_sequence_masks
@@ -232,6 +278,33 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     cache_indices_opt,
                     initial_state_mode_opt,
                 ) = get_non_spec_causal_conv1d_host_args(attn_metadata)
+
+                # Edge-cloud layer-sliced inference: when a decode batch is
+                # interleaved between two prefill slices, the decode path
+                # (causal_conv1d_update_npu) in-place updates conv_state for
+                # the decode requests' slots via a sliding-window write-back.
+                # The slots occupied by the current prefill request may overlap
+                # with those previously used by completed decode requests that
+                # have since been freed and reassigned.  As a result, the
+                # conv_state data at the prefill slots can be "polluted" by
+                # the decode's sliding-window format, which is incompatible
+                # with the format expected by npu_causal_conv1d_custom's
+                # InitRing (FN mode reads width-1 history columns from
+                # conv_state at a fixed offset, whereas decode writes them
+                # at a shifted offset).  When has_initial_state=True under
+                # these conditions, the CANN kernel reads stale/misaligned
+                # conv_state data and triggers aclnnCausalConv1d EZ9999.
+                #
+                # Fix: detect the layer-sliced continuation scenario (where
+                # conv_state for this layer was potentially written by a
+                # decode since the prefill metadata was built) and force
+                # initial_state_mode to all-zeros so the kernel initialises
+                # the ring buffer from scratch instead of reading the
+                # polluted conv_state.
+                initial_state_mode_opt = _maybe_reset_initial_state_for_layer_slice(
+                    attn_metadata, initial_state_mode_opt
+                )
+
                 mixed_qkv_non_spec = torch.ops._C_ascend.npu_causal_conv1d_custom(
                     mixed_qkv_non_spec,
                     conv_weights_T,

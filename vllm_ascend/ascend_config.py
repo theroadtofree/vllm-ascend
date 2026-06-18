@@ -597,6 +597,54 @@ class EplbConfig:
         logger.info("The number of redundant experts is %s", self.config["num_redundant_experts"])
 
 
+# Mapping table for ``PDSeparationConfig.next_prefill_prior_enable``.
+# When True, the edge scheduler is allowed to launch a second PREFILL_FIRST
+# batch while the previous one is still in flight (2P1D); otherwise the
+# scheduler stays at 1P1D. Kept as named constants so the mapping is easy to
+# grep and adjust if the channel pool grows in the future.
+_PD_PREFILL_INFLIGHT_WHEN_NEXT_PRIOR = 2  # 2P1D
+_PD_PREFILL_INFLIGHT_DEFAULT = 1          # 1P1D
+
+
+class PDSeparationConfig:
+    """PD-separation sub-config under ``edge_cloud_config``.
+
+    Configured via::
+
+        additional_config = {
+            "edge_cloud_config": {
+                "pd_separation": {
+                    "enabled": true,
+                    "next_prefill_prior_enable": true,
+                }
+            }
+        }
+    """
+
+    def __init__(self, user_config: dict | None = None):
+        if user_config is None:
+            user_config = {}
+        self.enabled: bool = user_config.get("enabled", False)
+        self.next_prefill_prior_enable: bool = user_config.get(
+            "next_prefill_prior_enable", False
+        )
+
+    @property
+    def prefill_inflight_limit(self) -> int:
+        """Integer limit consumed by ``PDSeparatedScheduler``."""
+        return (
+            _PD_PREFILL_INFLIGHT_WHEN_NEXT_PRIOR
+            if self.next_prefill_prior_enable
+            else _PD_PREFILL_INFLIGHT_DEFAULT
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"PDSeparationConfig(enabled={self.enabled}, "
+            f"next_prefill_prior_enable={self.next_prefill_prior_enable})"
+        )
+
+
 class EdgeCloudConfig:
     """Configuration for edge-cloud collaborative inference."""
 
@@ -611,6 +659,9 @@ class EdgeCloudConfig:
         self.decode_graph_min_tokens: int = user_config.get("decode_graph_min_tokens", 1)
         self.transfer_config: dict = user_config.get("transfer_config", {})
         self.hidden_dtype: str = user_config.get("hidden_dtype", "bf16")
+        self.pd_separation = PDSeparationConfig(
+            user_config.get("pd_separation", {}) or {}
+        )
 
         if self.enabled:
             self._validate()
@@ -659,7 +710,8 @@ class EdgeCloudConfig:
         return (
             f"EdgeCloudConfig(enabled={self.enabled}, role={self.role}, "
             f"mode={self.mode}, edge_head_tail_layers={self.edge_head_tail_layers}, "
-            f"enable_decode_graph={self.enable_decode_graph})"
+            f"enable_decode_graph={self.enable_decode_graph}, "
+            f"pd_separation={self.pd_separation})"
         )
 
 
