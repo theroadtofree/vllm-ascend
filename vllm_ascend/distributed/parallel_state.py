@@ -43,6 +43,30 @@ _DYNAMIC_EPLB: GroupCoordinator | None = None
 _EDGE_CLOUD_TENSOR_META: "EdgeCloudTensorMeta | None" = None
 
 
+def _ensure_hccl_comm_initialized(group: GroupCoordinator, group_name: str):
+    device_group = getattr(group, "device_group", None)
+    if device_group is None:
+        return
+
+    try:
+        backend = device_group._get_backend(torch.device("npu"))
+        local_rank = torch.distributed.get_rank(group=device_group)
+        backend.get_hccl_comm_name(local_rank)
+        logger.info(
+            "[EdgeCloud] Initialized HCCL communicator for %s group, "
+            "rank_in_group=%s, world_size=%s",
+            group_name,
+            local_rank,
+            group.world_size,
+        )
+    except AttributeError:
+        logger.debug(
+            "[EdgeCloud] HCCL communicator warmup skipped for %s group: "
+            "backend does not expose get_hccl_comm_name",
+            group_name,
+        )
+
+
 @dataclass
 class EdgeCloudTensorMeta:
     """Pre-computed tensor metadata for edge-cloud hidden state transfer.
@@ -157,6 +181,11 @@ def init_ascend_model_parallel(
             backend,
             group_name="mc2",
         )
+
+        if get_tp_group().world_size == 1:
+            _ensure_hccl_comm_initialized(get_tp_group(), "tp")
+        if _MC2.world_size == 1:
+            _ensure_hccl_comm_initialized(_MC2, "mc2")
 
         # Ascend-specific groups that are currently disabled by default
         # in edge-cloud mode. If enabled in the future, they must follow
