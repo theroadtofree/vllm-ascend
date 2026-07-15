@@ -630,6 +630,13 @@ from logging import DEBUG as _DEBUG  # noqa: E402
 def _patched_process_input_queue(self):
     """Exits when an engine step needs to be performed."""
     waited = False
+    _piq_rank = getattr(self, "dp_rank", "?")
+    logger.error(
+        "[HANG] _process_input_queue ENTER: dp_rank=%s has_work=%s has_unfinished=%s "
+        "batch_queue=%s engines_running=%s input_empty=%s",
+        _piq_rank, self.has_work(), self.scheduler.has_unfinished_requests(),
+        bool(self.batch_queue), self.engines_running, self.input_queue.empty(),
+    )
     while not self.has_work() and self.is_running():
         # Notify callbacks waiting for engine to become idle.
         self._notify_idle_state_callbacks()
@@ -656,6 +663,12 @@ def _patched_process_input_queue(self):
         ):
             block = True
 
+        logger.error(
+            "[HANG] _process_input_queue WAIT: dp_rank=%s has_unfinished=%s "
+            "batch_queue=%s engines_running=%s block=%s input_empty=%s",
+            _piq_rank, self.scheduler.has_unfinished_requests(),
+            bool(self.batch_queue), self.engines_running, block, self.input_queue.empty(),
+        )
         try:
             if block and self.input_queue.empty():
                 logger.info("input_queue is empty, EngineCore waiting for work.")
