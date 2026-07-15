@@ -710,6 +710,10 @@ class NPUWorker(WorkerBase):
         # this cloud DP participates in the cross-DP all_reduce / MoE
         # all-toall without real work, keeping the pairing with the real DP.
         if getattr(scheduler_output, "is_pd_dummy", False):
+            logger.error(
+                "[HANG] cloud _execute_model_cloud dummy-middle: dp_rank=%s",
+                getattr(self.model_runner, "dp_rank", "?"),
+            )
             self.model_runner._dummy_run(
                 num_tokens=self.model_runner.decode_token_per_req,
                 uniform_decode=True,
@@ -1162,6 +1166,11 @@ class NPUWorker(WorkerBase):
         self.model_runner.reset_encoder_cache()
 
     def execute_dummy_batch(self) -> None:
+        logger.error(
+            "[HANG] worker.execute_dummy_batch: dp_rank=%s role=%s",
+            getattr(self.model_runner, "dp_rank", "?"),
+            getattr(getattr(self.model_runner, "edge_cloud_cfg", None), "role", "?"),
+        )
         self.model_runner._dummy_run(num_tokens=self.model_runner.decode_token_per_req, uniform_decode=True)
 
     def _init_worker_distributed_environment(self) -> None:

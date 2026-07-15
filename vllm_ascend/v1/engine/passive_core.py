@@ -548,6 +548,14 @@ class PassiveEngineCoreProc:
         if batch.is_empty():
             return False
 
+        _disp_so = batch.scheduler_output
+        if getattr(_disp_so, "is_pd_dummy", False):
+            logger.error(
+                "[HANG] cloud step dispatch dummy: dp_rank=%s head_token=%s",
+                getattr(self.vllm_config.parallel_config, "data_parallel_rank", "?"),
+                getattr(_disp_so, "head_token", "?"),
+            )
+
         _slice_info_str = "["
         for s in batch.slices:
             if s is not None:

@@ -707,6 +707,13 @@ def _patched_execute_dummy_batch(self):
         dummy_so.head_token = uuid4().hex
         # Dynamic marker consumed by cloud _execute_model_cloud / PassiveEngineCore.step.
         setattr(dummy_so, "is_pd_dummy", True)
+        _dp_rank = getattr(
+            self, "dp_rank",
+            getattr(self.vllm_config.parallel_config, "data_parallel_rank", "?"))
+        vllm_logger.error(
+            "[HANG] edge publish dummy zmq: dp_rank=%s head_token=%s",
+            _dp_rank, dummy_so.head_token,
+        )
         ch.publish(dummy_so)
     self.model_executor.execute_dummy_batch()
 

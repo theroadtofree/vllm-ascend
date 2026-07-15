@@ -1289,16 +1289,37 @@ class NPUModelRunner(GPUModelRunner):
         # FIXME: Restore the `or self.vllm_config.model_config.enforce_eager` here
         # immediately once the other two flags are no longer needed.
         if self.dp_size == 1:
+            logger.error(
+                "[HANG] sync_metadata SKIP dp_size=1: dp_rank=%s role=%s",
+                self.dp_rank,
+                getattr(getattr(self, "edge_cloud_cfg", None), "role", "?"),
+            )
             return num_tokens, None, cudagraph_mode
 
+        _hang_role = getattr(getattr(self, "edge_cloud_cfg", None), "role", "?")
         if should_skip_allreduce_across_dp_group(self.vllm_config, is_draft_model):
+            logger.error(
+                "[HANG] sync_metadata SKIP should_skip: dp_rank=%s role=%s num_tokens=%s",
+                self.dp_rank, _hang_role, num_tokens,
+            )
             num_tokens_after_padding = torch.tensor([num_tokens] * self.dp_size, device="cpu", dtype=torch.int32)
             return num_tokens, num_tokens_after_padding, cudagraph_mode
 
         packed_tensor = torch.zeros(2, self.dp_size, device="cpu", dtype=torch.int32)
         packed_tensor[0][self.dp_rank] = num_tokens
         packed_tensor[1][self.dp_rank] = cudagraph_mode.value
+        import sys as _hang_sys
+        logger.error(
+            "[HANG] sync_metadata all_reduce ENTER: dp_rank=%s role=%s dp_group_ws=%s num_tokens=%s",
+            self.dp_rank, _hang_role, get_dp_group().world_size, num_tokens,
+        )
+        _hang_sys.stderr.flush()
         dist.all_reduce(packed_tensor, group=get_dp_group().cpu_group)
+        logger.error(
+            "[HANG] sync_metadata all_reduce EXIT: dp_rank=%s role=%s max_tokens=%s",
+            self.dp_rank, _hang_role, int(packed_tensor[0, :].max().item()),
+        )
+        _hang_sys.stderr.flush()
 
         # Unpack the results
         num_tokens_across_dp = packed_tensor[0, :]
