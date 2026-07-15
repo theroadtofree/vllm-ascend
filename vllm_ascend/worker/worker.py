@@ -705,6 +705,16 @@ class NPUWorker(WorkerBase):
         layer_slice_info: Any,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         """Cloud middle segment: recv -> segment_b/c -> isend -> return."""
+        # 方案③: dummy-middle published by the edge idle DP via zmq. Run a
+        # uniform-decode dummy forward (empty intermediate, no edge recv) so
+        # this cloud DP participates in the cross-DP all_reduce / MoE
+        # all-toall without real work, keeping the pairing with the real DP.
+        if getattr(scheduler_output, "is_pd_dummy", False):
+            self.model_runner._dummy_run(
+                num_tokens=self.model_runner.decode_token_per_req,
+                uniform_decode=True,
+            )
+            return None
         logger.info(
             f"Execute model, batch_type: {scheduler_output.batch_type}, " + (
                 f"slice: {layer_slice_info.slice_index + 1}/{layer_slice_info.total_slices}, "

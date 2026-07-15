@@ -676,6 +676,42 @@ def _patched_process_input_queue(self):
 
 
 # =======================================================================#
+# EngineCore.execute_dummy_batch - 方案③: route dummy per-DP via zmq.       #
+# =======================================================================#
+def _patched_execute_dummy_batch(self):
+    """PD-separation edge: mirror execute_model's per-DP zmq path so the
+    idle DP's dummy does NOT reach the cloud via the cross-node
+    rpc_broadcast_mq broadcast (which would deliver it to the DP running
+    real work and break cross-DP all_reduce pairing -> deadlock).
+
+    Cloud workers skip the cross-node ``execute_dummy_batch`` (see
+    multiproc_executor.worker_busy_loop), so ``executor.execute_dummy_batch``
+    below only runs the dummy on *this* DP's edge workers. We additionally
+    publish a dummy SchedulerOutput via zmq so the paired cloud DP runs a
+    dummy-middle (see worker._execute_model_cloud `is_pd_dummy` branch) and
+    keeps the cloud-side cross-DP all_reduce paired.
+
+    When PD-separation is off (no ``_pp_pd_channel``) this is identical to
+    upstream: just ``executor.execute_dummy_batch()``.
+    """
+    ch = getattr(self, "_pp_pd_channel", None)
+    if ch is not None:
+        from vllm.v1.core.sched.output import (
+            BatchType as _BatchType,
+            HiddenChannelType as _HiddenChannelType,
+            SchedulerOutput as _SchedulerOutput,
+        )
+        dummy_so = _SchedulerOutput.make_empty()
+        dummy_so.batch_type = _BatchType.DECODE_FIRST
+        dummy_so.hidden_channel = _HiddenChannelType.DECODE
+        dummy_so.head_token = uuid4().hex
+        # Dynamic marker consumed by cloud _execute_model_cloud / PassiveEngineCore.step.
+        setattr(dummy_so, "is_pd_dummy", True)
+        ch.publish(dummy_so)
+    self.model_executor.execute_dummy_batch()
+
+
+# =======================================================================#
 # Install                                                                  #
 # =======================================================================#
 def install() -> None:
@@ -695,6 +731,7 @@ def install() -> None:
     EngineCore._pop_deferred_empty_batch = _pop_deferred_empty_batch
     EngineCore.step = _patched_step
     EngineCore.step_with_batch_queue = _patched_step_with_batch_queue
+    EngineCore.execute_dummy_batch = _patched_execute_dummy_batch
     EngineCore.shutdown = _patched_engine_core_shutdown
 
     EngineCoreProc.run_engine_core = staticmethod(_patched_run_engine_core)

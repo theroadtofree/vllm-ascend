@@ -596,17 +596,22 @@ class PassiveEngineCoreProc:
             # has completed and started sending hidden states back.  Store the
             # original SchedulerOutput here and publish it from
             # _drain_worker_completion_acks() after the worker reports done.
-            if batch.scheduler_output.batch_type == BatchType.DECODE_FIRST:
-                self._maybe_publish_post_out(batch.scheduler_output)
-            elif (
-                batch.scheduler_output.batch_type == BatchType.PREFILL_FIRST
-                and (slice_info is None or slice_info.is_last_slice)
-            ):
-                head_token = getattr(batch.scheduler_output, "head_token", None)
-                if head_token:
-                    self._pending_post_out_by_head_token[head_token] = (
-                        batch.scheduler_output
-                    )
+            #
+            # 方案③: a dummy-middle (is_pd_dummy, published by the edge idle
+            # DP via zmq) has no real tail to return; skip POST_OUT so the
+            # edge does not expect a DECODE_LAST for it.
+            if not getattr(batch.scheduler_output, "is_pd_dummy", False):
+                if batch.scheduler_output.batch_type == BatchType.DECODE_FIRST:
+                    self._maybe_publish_post_out(batch.scheduler_output)
+                elif (
+                    batch.scheduler_output.batch_type == BatchType.PREFILL_FIRST
+                    and (slice_info is None or slice_info.is_last_slice)
+                ):
+                    head_token = getattr(batch.scheduler_output, "head_token", None)
+                    if head_token:
+                        self._pending_post_out_by_head_token[head_token] = (
+                            batch.scheduler_output
+                        )
         return True
 
     def _maybe_publish_post_out(
