@@ -346,18 +346,11 @@ def init_ascend_model_parallel(
         else:
             world_size_per_instance = edge_npu_count + cloud_npu_count
             # PD-separation: edge EP per-DP (each edge DP has all experts,
-            # EP size=1) to avoid 2:1 all_gather desync (DUMMY runs head+tail
-            # = 2 all_gathers, real runs 1 segment = 1). Cloud EP stays
-            # cross-DP (unchanged, 1:1). Minimal memory increase (edge 1-2
-            # layers only).
-            _pd_sep = False
-            try:
-                from vllm_ascend.ascend_config import get_ascend_config
-                _ec = getattr(get_ascend_config(), "edge_cloud_config", None)
-                _pd_sep = bool(_ec and getattr(_ec, "pd_separation", None)
-                               and _ec.pd_separation.enabled)
-            except Exception:
-                pass
+            # EP size=1) to avoid 2:1 all_gather desync. Use env var because
+            # get_ascend_config() is not yet initialized at this point (worker
+            # init). Set VLLM_PD_SEPARATION=1 when starting PD-separation mode.
+            import os as _os
+            _pd_sep = _os.environ.get("VLLM_PD_SEPARATION", "").lower() in ("1", "true")
             ep_edge_ranks = []
             ep_cloud_ranks = []
             for dp_idx in range(parallel_config.data_parallel_size):
