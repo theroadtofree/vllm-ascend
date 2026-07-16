@@ -345,15 +345,36 @@ def init_ascend_model_parallel(
                       1 + parallel_config.data_parallel_size * cloud_npu_count))
         else:
             world_size_per_instance = edge_npu_count + cloud_npu_count
+            # PD-separation: edge EP per-DP (each edge DP has all experts,
+            # EP size=1) to avoid 2:1 all_gather desync (DUMMY runs head+tail
+            # = 2 all_gathers, real runs 1 segment = 1). Cloud EP stays
+            # cross-DP (unchanged, 1:1). Minimal memory increase (edge 1-2
+            # layers only).
+            _pd_sep = False
+            try:
+                from vllm_ascend.ascend_config import get_ascend_config
+                _ec = getattr(get_ascend_config(), "edge_cloud_config", None)
+                _pd_sep = bool(_ec and getattr(_ec, "pd_separation", None)
+                               and _ec.pd_separation.enabled)
+            except Exception:
+                pass
             ep_edge_ranks = []
             ep_cloud_ranks = []
             for dp_idx in range(parallel_config.data_parallel_size):
                 base = dp_idx * world_size_per_instance
-                ep_edge_ranks.extend(range(base, base + edge_npu_count))
+                if _pd_sep:
+                    # Per-DP edge EP groups (size=1 each)
+                    ep_edge_ranks.append(list(range(base, base + edge_npu_count)))
+                else:
+                    ep_edge_ranks.extend(range(base, base + edge_npu_count))
                 ep_cloud_ranks.extend(
                     range(base + edge_npu_count, base + world_size_per_instance))
+        if _pd_sep:
+            _mc2_rank_lists = ep_edge_ranks + [ep_cloud_ranks]
+        else:
+            _mc2_rank_lists = [ep_edge_ranks, ep_cloud_ranks]
         _MC2 = init_model_parallel_group(
-            [ep_edge_ranks, ep_cloud_ranks],
+            _mc2_rank_lists,
             get_world_group().local_rank,
             backend,
             group_name="mc2",

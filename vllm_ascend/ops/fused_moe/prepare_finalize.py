@@ -438,7 +438,17 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                            and _ec.pd_separation.enabled)
         except Exception:
             pass
-        if self.moe_config.dp_size > 1 and not _pd_sep:
+        _skip_edge = False
+        try:
+            from vllm_ascend.ascend_config import get_ascend_config
+            _ec = getattr(get_ascend_config(), "edge_cloud_config", None)
+            _pd_sep = bool(_ec and getattr(_ec, "pd_separation", None)
+                           and _ec.pd_separation.enabled)
+            from vllm_ascend.distributed.parallel_state import is_edge_device
+            _skip_edge = _pd_sep and is_edge_device()
+        except Exception:
+            pass
+        if self.moe_config.dp_size > 1 and not _skip_edge:
             max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
 
             self.num_tokens = hidden_states.shape[0]
@@ -536,18 +546,17 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         Returns:
             Tensor with shape [original_local_num_tokens, hidden_size]
         """
-        # 方案A: skip cross-DP reduce_scatter when PD-separation is on
-        # (matches the skipped all_gather in prepare; each DP keeps its own
-        # output without scattering across DP).
-        _pd_sep = False
+        _skip_edge2 = False
         try:
             from vllm_ascend.ascend_config import get_ascend_config
             _ec = getattr(get_ascend_config(), "edge_cloud_config", None)
             _pd_sep = bool(_ec and getattr(_ec, "pd_separation", None)
                            and _ec.pd_separation.enabled)
+            from vllm_ascend.distributed.parallel_state import is_edge_device
+            _skip_edge2 = _pd_sep and is_edge_device()
         except Exception:
             pass
-        if self.moe_config.dp_size > 1 and not self.enable_shared_expert_dp and not _pd_sep:
+        if self.moe_config.dp_size > 1 and not self.enable_shared_expert_dp and not _skip_edge2:
             hidden_states = get_dp_group().reduce_scatter(hidden_states, 0)
             hidden_states = hidden_states[: self.num_tokens]
 
