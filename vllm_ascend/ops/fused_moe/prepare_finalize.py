@@ -423,7 +423,22 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             MoEPrepareOutput with global tensors.
         """
         self.enable_shared_expert_dp = enable_shared_expert_dp
-        if self.moe_config.dp_size > 1:
+        # 方案A (no extra memory): PD-separation skips the cross-DP MoE
+        # all_gather (prepare) + reduce_scatter (finalize). Each DP processes
+        # its own tokens independently (per-DP EP, each DP has all experts).
+        # This avoids the 2:1 all_gather desync (DUMMY runs head+tail=2,
+        # real runs 1 segment=1) that deadlocks the dummy-based lockstep.
+        # No expert replication (no memory increase) — only the cross-DP
+        # MoE DP communication is skipped.
+        _pd_sep = False
+        try:
+            from vllm_ascend.ascend_config import get_ascend_config
+            _ec = getattr(get_ascend_config(), "edge_cloud_config", None)
+            _pd_sep = bool(_ec and getattr(_ec, "pd_separation", None)
+                           and _ec.pd_separation.enabled)
+        except Exception:
+            pass
+        if self.moe_config.dp_size > 1 and not _pd_sep:
             max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
 
             self.num_tokens = hidden_states.shape[0]
@@ -521,7 +536,18 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         Returns:
             Tensor with shape [original_local_num_tokens, hidden_size]
         """
-        if self.moe_config.dp_size > 1 and not self.enable_shared_expert_dp:
+        # 方案A: skip cross-DP reduce_scatter when PD-separation is on
+        # (matches the skipped all_gather in prepare; each DP keeps its own
+        # output without scattering across DP).
+        _pd_sep = False
+        try:
+            from vllm_ascend.ascend_config import get_ascend_config
+            _ec = getattr(get_ascend_config(), "edge_cloud_config", None)
+            _pd_sep = bool(_ec and getattr(_ec, "pd_separation", None)
+                           and _ec.pd_separation.enabled)
+        except Exception:
+            pass
+        if self.moe_config.dp_size > 1 and not self.enable_shared_expert_dp and not _pd_sep:
             hidden_states = get_dp_group().reduce_scatter(hidden_states, 0)
             hidden_states = hidden_states[: self.num_tokens]
 
