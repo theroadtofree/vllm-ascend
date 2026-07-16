@@ -664,11 +664,19 @@ class NPUWorker(WorkerBase):
         """Edge tail segment (PL/DL): recv -> segment_e -> return output."""
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
         channel = self._hidden_channel_for(scheduler_output)
+        _hang_tail_rank = getattr(self.model_runner, "dp_rank", "?")
+        logger.error("[HANG] edge tail recv ENTER: dp_rank=%s channel=%s batch_type=%s",
+                    _hang_tail_rank, channel.value, scheduler_output.batch_type)
+        import sys as _hang_sys
+        _hang_sys.stderr.flush()
         tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
             num_tokens=scheduler_output.total_num_scheduled_tokens,
             channel=channel,
             sp_chunk=edge_sp and edge_merge,
         )
+        logger.error("[HANG] edge tail recv EXIT: dp_rank=%s channel=%s",
+                    _hang_tail_rank, channel.value)
+        _hang_sys.stderr.flush()
         logger.info(f"Receive intermediate tensors from cloud after, hidden_channel: {channel.value}")
 
         if edge_sp and not edge_merge:
@@ -826,12 +834,20 @@ class NPUWorker(WorkerBase):
         # 0, not the slot after the cloud.
         if get_pp_group().world_size > 1:
             channel = self._hidden_channel_for(scheduler_output)
+            _hang_ret_rank = getattr(self.model_runner, "dp_rank", "?")
+            logger.error("[HANG] cloud return isend ENTER: dp_rank=%s channel=%s",
+                        _hang_ret_rank, channel.value)
+            import sys as _hang_sys
+            _hang_sys.stderr.flush()
             self._record_pp_send_work(
                 edge_cloud_send_tensor_dict(_gathered, channel=channel,
                                             num_tokens=scheduler_output.total_num_scheduled_tokens,
                                             dst=0),
                 channel=channel,
             )
+            logger.error("[HANG] cloud return isend EXIT: dp_rank=%s channel=%s",
+                        _hang_ret_rank, channel.value)
+            _hang_sys.stderr.flush()
             logger.info(f"Send intermediate tensors to edge, hidden_channel={channel.value}")
         return output
 
