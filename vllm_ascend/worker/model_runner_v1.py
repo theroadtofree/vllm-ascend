@@ -5663,6 +5663,21 @@ class NPUModelRunner(GPUModelRunner):
                     {k: v[:intermediate_tokens] for k, v in self.intermediate_tensors.items()}
                 )
 
+                # PD-separation: skip segment_e on subsequent DUMMY runs.
+                # First run: capture acl_graph + 2nd all_gather (pairs with
+                # peer's first DUMMY, 2:2). Subsequent: 1 all_gather (segment_a
+                # only), matches real forward's 1 (1:1). Avoids 2:1 desync.
+                _pd_sep = False
+                try:
+                    from vllm_ascend.ascend_config import get_ascend_config
+                    _ec = getattr(get_ascend_config(), "edge_cloud_config", None)
+                    _pd_sep = bool(_ec and getattr(_ec, "pd_separation", None)
+                                   and _ec.pd_separation.enabled)
+                except Exception:
+                    pass
+                if _pd_sep and getattr(self, "_pd_dummy_seg_e_captured", False):
+                    return hidden_states, hidden_states
+
                 need_dummy_logits = not is_profile and lmhead_tp_enable()
                 max_num_reqs_across_dp = max_num_reqs * self.uniform_decode_query_len
                 dummy_indices = torch.zeros(max_num_reqs_across_dp, dtype=torch.int32)
@@ -5699,6 +5714,8 @@ class NPUModelRunner(GPUModelRunner):
                 if self.use_compress and force_attention:
                     self.positions.fill_(0)
                     self._dsa_positions_cpu_buf.fill_(0)
+                if _pd_sep:
+                    self._pd_dummy_seg_e_captured = True
             return hidden_states, hidden_states
 
     @torch.inference_mode()

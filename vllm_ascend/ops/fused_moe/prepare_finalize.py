@@ -423,13 +423,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             MoEPrepareOutput with global tensors.
         """
         self.enable_shared_expert_dp = enable_shared_expert_dp
-        # PD-separation fix: only do the cross-DP all_gather when
-        # enable_shared_expert_dp is True. When False (default), each DP
-        # processes its own tokens independently (per-DP EP), so the
-        # cross-DP all_gather is unnecessary AND causes a 2:1 desync
-        # (the edge _dummy_run runs head+tail = 2 all_gathers while the
-        # real PD-separation forward runs only 1 segment = 1 all_gather).
-        if self.moe_config.dp_size > 1 and self.enable_shared_expert_dp:
+        if self.moe_config.dp_size > 1:
             max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
 
             self.num_tokens = hidden_states.shape[0]
