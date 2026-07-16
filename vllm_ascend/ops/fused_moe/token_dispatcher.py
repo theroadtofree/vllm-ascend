@@ -228,11 +228,18 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         token_dispatch_input: MoETokenDispatchInput,
     ):
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(token_dispatch_input)
+        from vllm.logger import logger as _hang_logger
+        import sys as _hang_sys
+        _hang_ep = get_ep_group().rank_in_group
+        _hang_logger.error("[HANG] moe dispatch ENTER: ep_rank=%s", _hang_ep)
+        _hang_sys.stderr.flush()
         output = (
             torch_npu.npu_moe_distribute_dispatch_v2(**kwargs_mc2)
             if self.enable_dispatch_v2
             else torch_npu.npu_moe_distribute_dispatch(**kwargs_mc2)
         )
+        _hang_logger.error("[HANG] moe dispatch EXIT: ep_rank=%s", _hang_ep)
+        _hang_sys.stderr.flush()
         # comm_stream.wait_stream(torch.npu.current_stream())
         (
             expand_x,
