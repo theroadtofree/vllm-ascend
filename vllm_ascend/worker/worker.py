@@ -757,13 +757,25 @@ class NPUWorker(WorkerBase):
             # rather than the implicit "previous PP rank"
             # (which would not point at the edge for cloud
             # first-workers past the first one).
+            _hang_cld_rank = getattr(self.model_runner, "dp_rank", "?")
+            logger.error(
+                "[HANG] cloud recv ENTER: dp_rank=%s channel=%s tokens=%s",
+                _hang_cld_rank, channel.value,
+                scheduler_output.total_num_scheduled_tokens,
+            )
+            import sys as _hang_sys
+            _hang_sys.stderr.flush()
             tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
                 num_tokens=scheduler_output.total_num_scheduled_tokens,
                 channel=channel,
                 sp_chunk=do_sp_chunk and merge_payload,
                 src=0,
             )
-            logger.info(f"Received intermediate tensors from edge, hidden_channel={channel.value}")
+            logger.error(
+                "[HANG] cloud recv EXIT: dp_rank=%s channel=%s",
+                _hang_cld_rank, channel.value,
+            )
+            _hang_sys.stderr.flush()
 
             self.model_runner.cloud_prepare_early(scheduler_output)
             if do_sp_chunk and not merge_payload:
