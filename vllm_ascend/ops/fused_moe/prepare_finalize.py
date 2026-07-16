@@ -428,8 +428,14 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                 router_logits = nn.functional.pad(router_logits, (0, 0, 0, pad_size))
 
             # All-gather across DP group
+            from vllm.logger import logger as _hang_logger
+            import sys as _hang_sys
+            _hang_logger.error("[HANG] shared_expert dp_all_gather ENTER")
+            _hang_sys.stderr.flush()
             hidden_states = self.moe_config.dp_group.all_gather(hidden_states, 0)
             router_logits = self.moe_config.dp_group.all_gather(router_logits, 0)
+            _hang_logger.error("[HANG] shared_expert dp_all_gather EXIT")
+            _hang_sys.stderr.flush()
 
         if prefill_context_parallel_enable() and self.moe_config.pcp_size > 1:
             max_tokens_across_pcp = _EXTRA_CTX.max_tokens_across_pcp
