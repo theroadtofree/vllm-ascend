@@ -346,11 +346,16 @@ def init_ascend_model_parallel(
         else:
             world_size_per_instance = edge_npu_count + cloud_npu_count
             # PD-separation: edge EP per-DP (each edge DP has all experts,
-            # EP size=1) to avoid 2:1 all_gather desync. Use env var because
-            # get_ascend_config() is not yet initialized at this point (worker
-            # init). Set VLLM_PD_SEPARATION=1 when starting PD-separation mode.
-            import os as _os
-            _pd_sep = _os.environ.get("VLLM_PD_SEPARATION", "").lower() in ("1", "true")
+            # EP size=1) to avoid 2:1 all_gather desync. Use
+            # parallel_config.enable_edge_cloud (available at init time).
+            # TODO: distinguish PD-separation from PD-mix once ascend_config
+            # is available at this point.
+            _pd_sep = parallel_config.enable_edge_cloud
+            print(f"[DIAG-PS] init_ascend_model_parallel: pd_sep={_pd_sep} "
+                  f"enable_edge_cloud={parallel_config.enable_edge_cloud} "
+                  f"is_shared_model_edge={parallel_config.is_shared_model_edge} "
+                  f"edge_npu_count={edge_npu_count} dp_size={parallel_config.data_parallel_size}",
+                  flush=True)
             ep_edge_ranks = []
             ep_cloud_ranks = []
             for dp_idx in range(parallel_config.data_parallel_size):
