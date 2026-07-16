@@ -2592,6 +2592,19 @@ class NPUModelRunner(GPUModelRunner):
                 )
             # Fast path skips _update_states, so no deferred corrections.
             deferred_state_corrections_fn = None
+            # [方案③-fix Part 1] tail segment (PL/DL) reuses the head's cached
+            # num_tokens_across_dp and skips _determine_batch_execution_and_padding,
+            # so it does NOT enter the cross-DP all_reduce. But the idle DP's
+            # dummy (_dummy_run) always calls _sync_metadata_across_dp. Without
+            # this call, when this DP runs a tail step while the peer runs a
+            # dummy, the peer's all_reduce deadlocks waiting for a tail step
+            # that never calls it. Enter the collective here to keep the DP
+            # all_reduce pairing 1:1; the result is ignored (the tail uses the
+            # cached values above for the forward).
+            self._sync_metadata_across_dp(
+                num_tokens=scheduler_output.total_num_scheduled_tokens,
+                cudagraph_mode=cudagraph_mode,
+            )
         elif _cloud_fast_path:
             cache = self._cloud_prepare_cache
             self._cloud_prepare_cache = None  # consumed, clear for next iteration

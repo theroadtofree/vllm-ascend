@@ -460,6 +460,14 @@ def _patched_step_with_batch_queue(self):
         # _publish_pre_out_when_ready until it becomes next to execute.
         if scheduler_output.batch_type == BatchType.DECODE_FIRST:
             self._maybe_publish_pre_out(scheduler_output)
+        elif scheduler_output.batch_type in (
+            BatchType.PREFILL_LAST, BatchType.DECODE_LAST
+        ):
+            # [方案③-fix Part 2] tail segment is edge-local (no real cloud
+            # zmq), but the peer DP's dummy goes to cloud. Publish a
+            # dummy-middle zmq so the paired cloud DP runs a dummy-middle and
+            # keeps the cloud-side cross-DP all_reduce pairing 1:1.
+            self._publish_pd_dummy_zmq()
 
         if scheduler_output.batch_type == BatchType.EMPTY:
             if batch_queue:
@@ -731,6 +739,31 @@ def _patched_execute_dummy_batch(self):
     self.model_executor.execute_dummy_batch()
 
 
+def _publish_pd_dummy_zmq(self):
+    """Publish a dummy-middle zmq to the paired cloud DP (no edge dummy run).
+
+    Used by tail segments (PL/DL) which are edge-local: they don't send a
+    real cloud zmq, but the peer DP's dummy goes to cloud. To keep the
+    cloud-side cross-DP all_reduce pairing 1:1, the tail step publishes a
+    dummy-middle zmq so the paired cloud DP runs a dummy-middle (see
+    worker._execute_model_cloud `is_pd_dummy` branch).
+    """
+    ch = getattr(self, "_pp_pd_channel", None)
+    if ch is None:
+        return
+    from vllm.v1.core.sched.output import (
+        BatchType as _BatchType,
+        HiddenChannelType as _HiddenChannelType,
+        SchedulerOutput as _SchedulerOutput,
+    )
+    dummy_so = _SchedulerOutput.make_empty()
+    dummy_so.batch_type = _BatchType.DECODE_FIRST
+    dummy_so.hidden_channel = _HiddenChannelType.DECODE
+    dummy_so.head_token = uuid4().hex
+    setattr(dummy_so, "is_pd_dummy", True)
+    ch.publish(dummy_so)
+
+
 # =======================================================================#
 # Install                                                                  #
 # =======================================================================#
@@ -752,6 +785,7 @@ def install() -> None:
     EngineCore.step = _patched_step
     EngineCore.step_with_batch_queue = _patched_step_with_batch_queue
     EngineCore.execute_dummy_batch = _patched_execute_dummy_batch
+    EngineCore._publish_pd_dummy_zmq = _publish_pd_dummy_zmq
     EngineCore.shutdown = _patched_engine_core_shutdown
 
     EngineCoreProc.run_engine_core = staticmethod(_patched_run_engine_core)
