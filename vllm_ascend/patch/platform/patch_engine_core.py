@@ -442,6 +442,7 @@ def _patched_step_with_batch_queue(self):
         self._drain_pd_channel_inbox()
 
         scheduler_output = self.scheduler.schedule()
+        self._hang_last_bt = str(scheduler_output.batch_type)
 
         # [ascend insert] Assign head-token for edge-cloud head-segment
         # batches so the tail-segment can be matched to the suspended
