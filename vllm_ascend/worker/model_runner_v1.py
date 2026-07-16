@@ -5641,19 +5641,6 @@ class NPUModelRunner(GPUModelRunner):
                 self._dsa_positions_cpu_buf.fill_(0)
 
             # ========== Edge 设备特殊处理：Edge 首阶段需要执行最后一层 ==========
-            # PD-separation fix: head/tail are SEPARATE forwards (PF/DF=head,
-            # PL/DL=tail), each with 1 MoE layer (1 cross-DP all_gather). The
-            # dummy must match (1 all_gather, not 2). Skip the segment_e (tail)
-            # execution to avoid an extra cross-DP all_gather that desyncs from
-            # the real forward's count (2:1 mismatch -> deadlock).
-            _pd_sep = False
-            try:
-                from vllm_ascend.ascend_config import get_ascend_config
-                _ec = getattr(get_ascend_config(), "edge_cloud_config", None)
-                _pd_sep = bool(_ec and getattr(_ec, "pd_separation", None)
-                               and _ec.pd_separation.enabled)
-            except Exception:
-                pass
             if is_edge_device():
                 # 断言：边设备输出必须是 IntermediateTensors 类型
                 assert isinstance(outputs, IntermediateTensors)
@@ -5675,13 +5662,6 @@ class NPUModelRunner(GPUModelRunner):
                 intermediate_tensors = IntermediateTensors(
                     {k: v[:intermediate_tokens] for k, v in self.intermediate_tensors.items()}
                 )
-
-                # PD-separation: skip segment_e (tail) forward to match the
-                # real forward's 1 cross-DP all_gather (head only, not 2).
-                # The intermediate_tensors init above is still needed for the
-                # real tail forward (PREFILL_LAST/DECODE_LAST).
-                if _pd_sep:
-                    return hidden_states, hidden_states
 
                 need_dummy_logits = not is_profile and lmhead_tp_enable()
                 max_num_reqs_across_dp = max_num_reqs * self.uniform_decode_query_len
