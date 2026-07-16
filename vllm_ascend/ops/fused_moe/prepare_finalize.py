@@ -448,6 +448,17 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             _skip_edge = _pd_sep and is_edge_device()
         except Exception:
             pass
+        try:
+            from vllm.distributed.parallel_state import get_ep_group
+            _ep_ws = get_ep_group().world_size
+        except Exception:
+            _ep_ws = "?"
+        from vllm.logger import logger as _diag_logger
+        _diag_logger.error(
+            "[DIAG] prepare: skip_edge=%s ep_ws=%s dp_size=%s num_experts_local=%s",
+            _skip_edge, _ep_ws, self.moe_config.dp_size,
+            getattr(self, 'num_experts_local', '?'),
+        )
         if self.moe_config.dp_size > 1 and not _skip_edge:
             max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
 

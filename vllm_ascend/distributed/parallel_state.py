@@ -379,6 +379,11 @@ def init_ascend_model_parallel(
             backend,
             group_name="mc2",
         )
+        from vllm.logger import logger as _diag_logger
+        _diag_logger.error(
+            "[DIAG] EP construction: pd_sep=%s edge_groups=%s cloud_ranks=%s",
+            _pd_sep, ep_edge_ranks, ep_cloud_ranks,
+        )
 
         # Phase6 hidden data-plane channels are still required in edge-cloud
         # mode.  The default PP group is PREFILL_1, the alternate PP group is
