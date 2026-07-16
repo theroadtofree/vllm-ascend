@@ -5654,7 +5654,7 @@ class NPUModelRunner(GPUModelRunner):
                                and _ec.pd_separation.enabled)
             except Exception:
                 pass
-            if is_edge_device() and not _pd_sep:
+            if is_edge_device():
                 # 断言：边设备输出必须是 IntermediateTensors 类型
                 assert isinstance(outputs, IntermediateTensors)
 
@@ -5675,6 +5675,13 @@ class NPUModelRunner(GPUModelRunner):
                 intermediate_tensors = IntermediateTensors(
                     {k: v[:intermediate_tokens] for k, v in self.intermediate_tensors.items()}
                 )
+
+                # PD-separation: skip segment_e (tail) forward to match the
+                # real forward's 1 cross-DP all_gather (head only, not 2).
+                # The intermediate_tensors init above is still needed for the
+                # real tail forward (PREFILL_LAST/DECODE_LAST).
+                if _pd_sep:
+                    return hidden_states, hidden_states
 
                 need_dummy_logits = not is_profile and lmhead_tp_enable()
                 max_num_reqs_across_dp = max_num_reqs * self.uniform_decode_query_len
