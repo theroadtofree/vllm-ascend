@@ -2399,6 +2399,11 @@ class NPUModelRunner(GPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
         layer_slice_info: Any = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        try:
+            from vllm_ascend.ops.fused_moe.prepare_finalize import _HANG_STATE as _hang_st
+            _hang_st["fwd_type"] = str(scheduler_output.batch_type)
+        except Exception:
+            pass
         if self.vllm_config.model_config.enable_return_routed_experts:
             if vllm_version_is("0.20.2"):
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -5318,6 +5323,11 @@ class NPUModelRunner(GPUModelRunner):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
+        try:
+            from vllm_ascend.ops.fused_moe.prepare_finalize import _HANG_STATE as _hang_st
+            _hang_st["fwd_type"] = "DUMMY"
+        except Exception:
+            pass
         # If cudagraph_mode.decode_mode() == FULL and
         # cudagraph_mode.separate_routine(). This means that we are using
         # different graphs and/or modes for mixed prefill-decode batches vs.

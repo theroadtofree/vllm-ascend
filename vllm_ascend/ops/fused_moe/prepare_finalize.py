@@ -36,6 +36,11 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEPrepareOutput
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import enable_sp, enable_sp_by_pass, npu_stream_switch, prefill_context_parallel_enable
 
+# [HANG-diag] current forward type, set by model_runner before each forward
+# (batch_type for real head/tail, "DUMMY" for _dummy_run). Read by the
+# shared_expert dp_all_gather log to count collectives per forward type.
+_HANG_STATE = {"fwd_type": "?"}
+
 
 class PrepareAndFinalize(ABC):
     """
@@ -430,11 +435,12 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             # All-gather across DP group
             from vllm.logger import logger as _hang_logger
             import sys as _hang_sys
-            _hang_logger.error("[HANG] shared_expert dp_all_gather ENTER")
+            _hang_ft = _HANG_STATE.get("fwd_type", "?")
+            _hang_logger.error("[HANG] shared_expert dp_all_gather ENTER: fwd_type=%s", _hang_ft)
             _hang_sys.stderr.flush()
             hidden_states = self.moe_config.dp_group.all_gather(hidden_states, 0)
             router_logits = self.moe_config.dp_group.all_gather(router_logits, 0)
-            _hang_logger.error("[HANG] shared_expert dp_all_gather EXIT")
+            _hang_logger.error("[HANG] shared_expert dp_all_gather EXIT: fwd_type=%s", _hang_ft)
             _hang_sys.stderr.flush()
 
         if prefill_context_parallel_enable() and self.moe_config.pcp_size > 1:
