@@ -1309,9 +1309,14 @@ class NPUModelRunner(GPUModelRunner):
         packed_tensor[0][self.dp_rank] = num_tokens
         packed_tensor[1][self.dp_rank] = cudagraph_mode.value
         import sys as _hang_sys
+        try:
+            from vllm_ascend.ops.fused_moe.prepare_finalize import _HANG_STATE as _hang_st
+            _hang_ft = _hang_st.get("fwd_type", "?")
+        except Exception:
+            _hang_ft = "?"
         logger.error(
-            "[HANG] sync_metadata all_reduce ENTER: dp_rank=%s role=%s dp_group_ws=%s num_tokens=%s",
-            self.dp_rank, _hang_role, get_dp_group().world_size, num_tokens,
+            "[HANG] sync_metadata all_reduce ENTER: dp_rank=%s role=%s dp_group_ws=%s num_tokens=%s fwd_type=%s",
+            self.dp_rank, _hang_role, get_dp_group().world_size, num_tokens, _hang_ft,
         )
         _hang_sys.stderr.flush()
         dist.all_reduce(packed_tensor, group=get_dp_group().cpu_group)
