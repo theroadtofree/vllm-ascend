@@ -377,12 +377,11 @@ def init_ascend_model_parallel(
             backend,
             group_name="mc2",
         )
-        # PD-separation: override vllm's EP group with the MC2 group.
-        # For edge: MC2 is per-DP (size 1, all experts). For cloud: MC2
-        # is cross-DP (size 8, unchanged). This makes get_ep_group() return
-        # the correct per-DP group for edge, so expert loading uses all
-        # experts and the MoE all-toall is local (no cross-DP desync).
-        if _pd_sep:
+        # PD-separation: override vllm's EP group with the MC2 group,
+        # but ONLY for edge workers. Cloud keeps vllm's original EP group
+        # (MC2 cloud group may have different rank_in_group ordering, which
+        # would break cloud expert loading).
+        if _pd_sep and parallel_config.is_edge_node:
             import vllm.distributed.parallel_state as _vllm_ps
             _vllm_ps._EP = _MC2
         from vllm.logger import logger as _diag_logger
