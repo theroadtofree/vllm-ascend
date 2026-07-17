@@ -549,7 +549,7 @@ class PassiveEngineCoreProc:
             return False
 
         _disp_so = batch.scheduler_output
-        if getattr(_disp_so, "is_pd_dummy", False):
+        if _disp_so.total_num_scheduled_tokens == 0:
             logger.error(
                 "[HANG] cloud step dispatch dummy: dp_rank=%s head_token=%s",
                 getattr(self.vllm_config.parallel_config, "data_parallel_rank", "?"),
@@ -608,7 +608,7 @@ class PassiveEngineCoreProc:
             # 方案③: a dummy-middle (is_pd_dummy, published by the edge idle
             # DP via zmq) has no real tail to return; skip POST_OUT so the
             # edge does not expect a DECODE_LAST for it.
-            if not getattr(batch.scheduler_output, "is_pd_dummy", False):
+            if batch.scheduler_output.total_num_scheduled_tokens > 0:
                 if batch.scheduler_output.batch_type == BatchType.DECODE_FIRST:
                     self._maybe_publish_post_out(batch.scheduler_output)
                 elif (

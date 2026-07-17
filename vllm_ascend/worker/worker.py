@@ -740,7 +740,10 @@ class NPUWorker(WorkerBase):
         # uniform-decode dummy forward (empty intermediate, no edge recv) so
         # this cloud DP participates in the cross-DP all_reduce / MoE
         # all-toall without real work, keeping the pairing with the real DP.
-        if getattr(scheduler_output, "is_pd_dummy", False):
+        # PD-separation dummy-middle: identified by empty scheduler_output
+        # (total_num_scheduled_tokens == 0). is_pd_dummy dynamic attr is
+        # lost during zmq serialization, so use the native field instead.
+        if scheduler_output.total_num_scheduled_tokens == 0:
             logger.error(
                 "[HANG] cloud _execute_model_cloud dummy-middle: dp_rank=%s",
                 getattr(self.model_runner, "dp_rank", "?"),
@@ -857,6 +860,7 @@ class NPUWorker(WorkerBase):
         # 0, not the slot after the cloud.
         if get_pp_group().world_size > 1:
             channel = self._hidden_channel_for(scheduler_output)
+            _hang_ret_rank = getattr(self.model_runner, "dp_rank", "?")
             # PD-separation diagnostic: log hidden_states norm at cloud output
             _hs_c = _gathered.get("hidden_states")
             if _hs_c is not None:
