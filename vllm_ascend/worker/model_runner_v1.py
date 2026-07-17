@@ -5591,6 +5591,10 @@ class NPUModelRunner(GPUModelRunner):
                     _skip_head = True
                 elif _peer_bt in (1, 3):  # peer is head (PF/DF)
                     _skip_tail = True
+                logger.error(
+                    "[DBG] _dummy_run: dp_rank=%s peer_bt=%s skip_head=%s skip_tail=%s",
+                    self.dp_rank, _peer_bt, _skip_head, _skip_tail,
+                )
 
             if not _skip_head:
                 with set_ascend_forward_context(
