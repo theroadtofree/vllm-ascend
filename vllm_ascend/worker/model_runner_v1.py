@@ -5591,6 +5591,12 @@ class NPUModelRunner(GPUModelRunner):
                     _skip_head = True
                 elif _peer_bt in (1, 3):  # peer is head (PF/DF)
                     _skip_tail = True
+                elif _peer_bt == 0:  # both DUMMY (idle or waiting)
+                    # Skip both segments: no real data to all_gather.
+                    # Only sync_metadata (already done) keeps the all_reduce
+                    # pairing. This makes DUMMY instant (no MoE forward).
+                    _skip_head = True
+                    _skip_tail = True
                 logger.error(
                     "[DBG] _dummy_run: dp_rank=%s peer_bt=%s skip_head=%s skip_tail=%s",
                     self.dp_rank, _peer_bt, _skip_head, _skip_tail,
