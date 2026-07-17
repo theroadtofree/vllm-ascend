@@ -5542,6 +5542,19 @@ class NPUModelRunner(GPUModelRunner):
                     intermediate_tensors = IntermediateTensors(
                         {k: v[:intermediate_tokens] for k, v in self.intermediate_tensors.items()}
                     )
+                    # Zero-fill to avoid NaN from uninitialized memory
+                    # (make_empty_intermediate_tensors may use torch.empty)
+                    for _k, _v in intermediate_tensors.items():
+                        _v.zero_()
+                    _diag_hs = intermediate_tensors.get("hidden_states")
+                    if _diag_hs is not None:
+                        logger.error(
+                            "[PD-DIAG] D. cloud _dummy_run INPUT (intermediate_tensors): "
+                            "shape=%s norm=%.6f mean=%.6f",
+                            list(_diag_hs.shape),
+                            float(_diag_hs.float().norm().item()),
+                            float(_diag_hs.float().mean().item()),
+                        )
             elif get_pp_group().is_first_rank:
                 intermediate_tensors = None
             else:
@@ -5625,6 +5638,15 @@ class NPUModelRunner(GPUModelRunner):
                     hidden_states = outputs["hidden_states"]
                 else:
                     hidden_states = outputs
+                # PD-separation diagnostic: log _dummy_run segment_a output
+                if not is_profile and not is_graph_capturing:
+                    _has_nan = bool(torch.isnan(hidden_states).any().item()) if hasattr(hidden_states, 'shape') and hidden_states.dim() > 0 else '?'
+                    logger.error(
+                        "[PD-DIAG] E. _dummy_run segment_a OUTPUT: "
+                        "shape=%s has_nan=%s",
+                        list(hidden_states.shape) if hasattr(hidden_states, 'shape') else '?',
+                        _has_nan,
+                    )
                 dummy_compute_logits(hidden_states)
 
                 if self.drafter:
