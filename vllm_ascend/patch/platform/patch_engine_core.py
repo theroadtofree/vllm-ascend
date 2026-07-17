@@ -717,7 +717,14 @@ def _patched_execute_dummy_batch(self):
     upstream: just ``executor.execute_dummy_batch()``.
     """
     ch = getattr(self, "_pp_pd_channel", None)
-    if ch is not None:
+    # Only publish dummy zmq if this DP is truly idle (no unfinished requests).
+    # When DP0 has unfinished requests (waiting for cloud PL/DL), it runs
+    # DUMMY every busy-loop iteration. Publishing dummy zmq each time floods
+    # the cloud's zmq channel, delaying real PL/DL returns.
+    # The cloud DP0 is already processing the real PF/DF from this DP -
+    # it doesn't need a dummy.
+    _has_unfinished = self.scheduler.has_unfinished_requests()
+    if ch is not None and not _has_unfinished:
         from vllm.v1.core.sched.output import (
             BatchType as _BatchType,
             HiddenChannelType as _HiddenChannelType,
@@ -729,13 +736,6 @@ def _patched_execute_dummy_batch(self):
         dummy_so.head_token = uuid4().hex
         # Dynamic marker consumed by cloud _execute_model_cloud / PassiveEngineCore.step.
         setattr(dummy_so, "is_pd_dummy", True)
-        _dp_rank = getattr(
-            self, "dp_rank",
-            getattr(self.vllm_config.parallel_config, "data_parallel_rank", "?"))
-        vllm_logger.error(
-            "[HANG] edge publish dummy zmq: dp_rank=%s head_token=%s",
-            _dp_rank, dummy_so.head_token,
-        )
         ch.publish(dummy_so)
     self.model_executor.execute_dummy_batch()
 
