@@ -468,7 +468,12 @@ def _patched_step_with_batch_queue(self):
             # zmq), but the peer DP's dummy goes to cloud. Publish a
             # dummy-middle zmq so the paired cloud DP runs a dummy-middle and
             # keeps the cloud-side cross-DP all_reduce pairing 1:1.
-            self._publish_pd_dummy_zmq()
+            # ONLY for dp>1: dp=1 has no peer DP, no cross-DP all_gather
+            # to pair. Publishing dummy zmq in dp=1 corrupts the cloud's
+            # PassiveScheduler state machine (dummy DECODE_FIRST interferes
+            # with the real prefill/decode sequence).
+            if getattr(self.vllm_config.parallel_config, 'data_parallel_size', 1) > 1:
+                self._publish_pd_dummy_zmq()
 
         if scheduler_output.batch_type == BatchType.EMPTY:
             if batch_queue:
@@ -717,14 +722,12 @@ def _patched_execute_dummy_batch(self):
     upstream: just ``executor.execute_dummy_batch()``.
     """
     ch = getattr(self, "_pp_pd_channel", None)
-    # Only publish dummy zmq if this DP is truly idle (no unfinished requests).
-    # When DP0 has unfinished requests (waiting for cloud PL/DL), it runs
-    # DUMMY every busy-loop iteration. Publishing dummy zmq each time floods
-    # the cloud's zmq channel, delaying real PL/DL returns.
-    # The cloud DP0 is already processing the real PF/DF from this DP -
-    # it doesn't need a dummy.
+    # Only publish dummy zmq if dp>1 AND this DP is truly idle (no unfinished
+    # requests). For dp=1, no peer DP exists, no cross-DP all_gather to pair.
+    # Publishing dummy zmq in dp=1 corrupts the cloud's PassiveScheduler.
     _has_unfinished = self.scheduler.has_unfinished_requests()
-    if ch is not None and not _has_unfinished:
+    _dp_gt1 = getattr(self.vllm_config.parallel_config, 'data_parallel_size', 1) > 1
+    if ch is not None and not _has_unfinished and _dp_gt1:
         from vllm.v1.core.sched.output import (
             BatchType as _BatchType,
             HiddenChannelType as _HiddenChannelType,

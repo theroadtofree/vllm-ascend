@@ -630,6 +630,14 @@ class NPUWorker(WorkerBase):
             return output
 
         assert isinstance(output, IntermediateTensors)
+        # PD-separation diagnostic: log hidden_states norm at head output
+        _hs = output.tensors.get("hidden_states")
+        if _hs is not None:
+            logger.error(
+                "[PD-DIAG] A. edge head OUTPUT: bt=%s shape=%s norm=%.6f mean=%.6f",
+                scheduler_output.batch_type, list(_hs.shape),
+                float(_hs.float().norm().item()), float(_hs.float().mean().item()),
+            )
         # Edge-cloud with heterogeneous SP: aggregate SP shards to full
         # sequence before cross-PP send so cloud can re-chunk by its SP.
         if enable_sp() and (self.model_runner.edge_cloud_cfg.mode != "embedding_only"
@@ -695,6 +703,21 @@ class NPUWorker(WorkerBase):
             scheduler_output, intermediate_tensors,
             layer_slice_info=layer_slice_info,
         )
+        # PD-separation diagnostic: log at tail output (final result)
+        if isinstance(output, ModelRunnerOutput):
+            _logits = getattr(output, "sampled_token_ids", None)
+            logger.error(
+                "[PD-DIAG] C. edge tail OUTPUT (ModelRunnerOutput): bt=%s",
+                scheduler_output.batch_type,
+            )
+        elif isinstance(output, IntermediateTensors):
+            _hs_t = output.tensors.get("hidden_states")
+            if _hs_t is not None:
+                logger.error(
+                    "[PD-DIAG] C. edge tail OUTPUT (IT): bt=%s shape=%s norm=%.6f mean=%.6f",
+                    scheduler_output.batch_type, list(_hs_t.shape),
+                    float(_hs_t.float().norm().item()), float(_hs_t.float().mean().item()),
+                )
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}, after.")
 
         is_last_slice = (
@@ -834,11 +857,14 @@ class NPUWorker(WorkerBase):
         # 0, not the slot after the cloud.
         if get_pp_group().world_size > 1:
             channel = self._hidden_channel_for(scheduler_output)
-            _hang_ret_rank = getattr(self.model_runner, "dp_rank", "?")
-            logger.error("[HANG] cloud return isend ENTER: dp_rank=%s channel=%s",
-                        _hang_ret_rank, channel.value)
-            import sys as _hang_sys
-            _hang_sys.stderr.flush()
+            # PD-separation diagnostic: log hidden_states norm at cloud output
+            _hs_c = _gathered.get("hidden_states")
+            if _hs_c is not None:
+                logger.error(
+                    "[PD-DIAG] B. cloud middle OUTPUT: bt=%s shape=%s norm=%.6f mean=%.6f",
+                    scheduler_output.batch_type, list(_hs_c.shape),
+                    float(_hs_c.float().norm().item()), float(_hs_c.float().mean().item()),
+                )
             self._record_pp_send_work(
                 edge_cloud_send_tensor_dict(_gathered, channel=channel,
                                             num_tokens=scheduler_output.total_num_scheduled_tokens,
