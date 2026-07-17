@@ -36,11 +36,6 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEPrepareOutput
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import enable_sp, enable_sp_by_pass, npu_stream_switch, prefill_context_parallel_enable
 
-# [HANG-diag] current forward type, set by model_runner before each forward
-# (batch_type for real head/tail, "DUMMY" for _dummy_run). Read by the
-# shared_expert dp_all_gather log to count collectives per forward type.
-_HANG_STATE = {"fwd_type": "?"}
-
 
 class PrepareAndFinalize(ABC):
     """
@@ -423,43 +418,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             MoEPrepareOutput with global tensors.
         """
         self.enable_shared_expert_dp = enable_shared_expert_dp
-        # 方案A (no extra memory): PD-separation skips the cross-DP MoE
-        # all_gather (prepare) + reduce_scatter (finalize). Each DP processes
-        # its own tokens independently (per-DP EP, each DP has all experts).
-        # This avoids the 2:1 all_gather desync (DUMMY runs head+tail=2,
-        # real runs 1 segment=1) that deadlocks the dummy-based lockstep.
-        # No expert replication (no memory increase) — only the cross-DP
-        # MoE DP communication is skipped.
-        _pd_sep = False
-        try:
-            from vllm_ascend.ascend_config import get_ascend_config
-            _ec = getattr(get_ascend_config(), "edge_cloud_config", None)
-            _pd_sep = bool(_ec and getattr(_ec, "pd_separation", None)
-                           and _ec.pd_separation.enabled)
-        except Exception:
-            pass
-        _skip_edge = False
-        try:
-            from vllm_ascend.ascend_config import get_ascend_config
-            _ec = getattr(get_ascend_config(), "edge_cloud_config", None)
-            _pd_sep = bool(_ec and getattr(_ec, "pd_separation", None)
-                           and _ec.pd_separation.enabled)
-            from vllm_ascend.distributed.parallel_state import is_edge_device
-            _skip_edge = _pd_sep and is_edge_device()
-        except Exception:
-            pass
-        try:
-            from vllm.distributed.parallel_state import get_ep_group
-            _ep_ws = get_ep_group().world_size
-        except Exception:
-            _ep_ws = "?"
-        from vllm.logger import logger as _diag_logger
-        _diag_logger.error(
-            "[DIAG] prepare: skip_edge=%s ep_ws=%s dp_size=%s num_experts_local=%s",
-            _skip_edge, _ep_ws, self.moe_config.dp_size,
-            getattr(self, 'num_experts_local', '?'),
-        )
-        if self.moe_config.dp_size > 1 and not _skip_edge:
+        if self.moe_config.dp_size > 1:
             max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
 
             self.num_tokens = hidden_states.shape[0]
@@ -469,15 +428,8 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                 router_logits = nn.functional.pad(router_logits, (0, 0, 0, pad_size))
 
             # All-gather across DP group
-            from vllm.logger import logger as _hang_logger
-            import sys as _hang_sys
-            _hang_ft = _HANG_STATE.get("fwd_type", "?")
-            _hang_logger.error("[HANG] shared_expert dp_all_gather ENTER: fwd_type=%s", _hang_ft)
-            _hang_sys.stderr.flush()
             hidden_states = self.moe_config.dp_group.all_gather(hidden_states, 0)
             router_logits = self.moe_config.dp_group.all_gather(router_logits, 0)
-            _hang_logger.error("[HANG] shared_expert dp_all_gather EXIT: fwd_type=%s", _hang_ft)
-            _hang_sys.stderr.flush()
 
         if prefill_context_parallel_enable() and self.moe_config.pcp_size > 1:
             max_tokens_across_pcp = _EXTRA_CTX.max_tokens_across_pcp
@@ -557,17 +509,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         Returns:
             Tensor with shape [original_local_num_tokens, hidden_size]
         """
-        _skip_edge2 = False
-        try:
-            from vllm_ascend.ascend_config import get_ascend_config
-            _ec = getattr(get_ascend_config(), "edge_cloud_config", None)
-            _pd_sep = bool(_ec and getattr(_ec, "pd_separation", None)
-                           and _ec.pd_separation.enabled)
-            from vllm_ascend.distributed.parallel_state import is_edge_device
-            _skip_edge2 = _pd_sep and is_edge_device()
-        except Exception:
-            pass
-        if self.moe_config.dp_size > 1 and not self.enable_shared_expert_dp and not _skip_edge2:
+        if self.moe_config.dp_size > 1 and not self.enable_shared_expert_dp:
             hidden_states = get_dp_group().reduce_scatter(hidden_states, 0)
             hidden_states = hidden_states[: self.num_tokens]
 

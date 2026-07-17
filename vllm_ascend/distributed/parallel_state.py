@@ -345,49 +345,18 @@ def init_ascend_model_parallel(
                       1 + parallel_config.data_parallel_size * cloud_npu_count))
         else:
             world_size_per_instance = edge_npu_count + cloud_npu_count
-            # PD-separation: edge EP per-DP (each edge DP has all experts,
-            # EP size=1) to avoid 2:1 all_gather desync. Use
-            # parallel_config.enable_edge_cloud (available at init time).
-            # TODO: distinguish PD-separation from PD-mix once ascend_config
-            # is available at this point.
-            _pd_sep = parallel_config.enable_edge_cloud
-            print(f"[DIAG-PS] init_ascend_model_parallel: pd_sep={_pd_sep} "
-                  f"enable_edge_cloud={parallel_config.enable_edge_cloud} "
-                  f"is_shared_model_edge={parallel_config.is_shared_model_edge} "
-                  f"edge_npu_count={edge_npu_count} dp_size={parallel_config.data_parallel_size}",
-                  flush=True)
             ep_edge_ranks = []
             ep_cloud_ranks = []
             for dp_idx in range(parallel_config.data_parallel_size):
                 base = dp_idx * world_size_per_instance
-                if _pd_sep:
-                    # Per-DP edge EP groups (size=1 each)
-                    ep_edge_ranks.append(list(range(base, base + edge_npu_count)))
-                else:
-                    ep_edge_ranks.extend(range(base, base + edge_npu_count))
+                ep_edge_ranks.extend(range(base, base + edge_npu_count))
                 ep_cloud_ranks.extend(
                     range(base + edge_npu_count, base + world_size_per_instance))
-        if _pd_sep:
-            _mc2_rank_lists = ep_edge_ranks + [ep_cloud_ranks]
-        else:
-            _mc2_rank_lists = [ep_edge_ranks, ep_cloud_ranks]
         _MC2 = init_model_parallel_group(
-            _mc2_rank_lists,
+            [ep_edge_ranks, ep_cloud_ranks],
             get_world_group().local_rank,
             backend,
             group_name="mc2",
-        )
-        # PD-separation: override vllm's EP group with the MC2 group,
-        # but ONLY for edge workers. Cloud keeps vllm's original EP group
-        # (MC2 cloud group may have different rank_in_group ordering, which
-        # would break cloud expert loading).
-        if _pd_sep and parallel_config.is_edge_node:
-            import vllm.distributed.parallel_state as _vllm_ps
-            _vllm_ps._EP = _MC2
-        from vllm.logger import logger as _diag_logger
-        _diag_logger.error(
-            "[DIAG] EP construction: pd_sep=%s edge_groups=%s cloud_ranks=%s",
-            _pd_sep, ep_edge_ranks, ep_cloud_ranks,
         )
 
         # Phase6 hidden data-plane channels are still required in edge-cloud
