@@ -5546,15 +5546,14 @@ class NPUModelRunner(GPUModelRunner):
                     # (make_empty_intermediate_tensors may use torch.empty)
                     for _k, _v in intermediate_tensors.items():
                         _v.zero_()
-                    _diag_hs = intermediate_tensors.get("hidden_states")
-                    if _diag_hs is not None:
-                        logger.error(
-                            "[PD-DIAG] D. cloud _dummy_run INPUT (intermediate_tensors): "
-                            "shape=%s norm=%.6f mean=%.6f",
-                            list(_diag_hs.shape),
-                            float(_diag_hs.float().norm().item()),
-                            float(_diag_hs.float().mean().item()),
-                        )
+                    _diag_hs = intermediate_tensors["hidden_states"]
+                    logger.error(
+                        "[PD-DIAG] D. cloud _dummy_run INPUT (intermediate_tensors): "
+                        "shape=%s norm=%.6f mean=%.6f",
+                        list(_diag_hs.shape),
+                        float(_diag_hs.float().norm().item()),
+                        float(_diag_hs.float().mean().item()),
+                    )
             elif get_pp_group().is_first_rank:
                 intermediate_tensors = None
             else:
