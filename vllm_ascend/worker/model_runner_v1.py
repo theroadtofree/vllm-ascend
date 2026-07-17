@@ -5585,7 +5585,7 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = None
             _skip_head = False
             _skip_tail = False
-            if is_edge_device() and not is_profile:
+            if is_edge_device() and not is_profile and not is_graph_capturing:
                 _peer_bt = self._peer_batch_type_id
                 if _peer_bt in (2, 4):  # peer is tail (PL/DL)
                     _skip_head = True
