@@ -456,6 +456,11 @@ class NPUModelRunner(GPUModelRunner):
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        # PD-separation: batch_type_id for cross-DP sync (0=DUMMY, 1=PF,
+        # 2=PL, 3=DF, 4=DL). Packed into sync_metadata all_reduce so the
+        # idle DP's DUMMY can match the real DP's segment (head or tail).
+        self._dp_batch_type_id = 0
+        self._peer_batch_type_id = 0
 
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
@@ -1289,42 +1294,20 @@ class NPUModelRunner(GPUModelRunner):
         # FIXME: Restore the `or self.vllm_config.model_config.enforce_eager` here
         # immediately once the other two flags are no longer needed.
         if self.dp_size == 1:
-            logger.error(
-                "[HANG] sync_metadata SKIP dp_size=1: dp_rank=%s role=%s",
-                self.dp_rank,
-                getattr(getattr(self, "edge_cloud_cfg", None), "role", "?"),
-            )
             return num_tokens, None, cudagraph_mode
 
-        _hang_role = getattr(getattr(self, "edge_cloud_cfg", None), "role", "?")
         if should_skip_allreduce_across_dp_group(self.vllm_config, is_draft_model):
-            logger.error(
-                "[HANG] sync_metadata SKIP should_skip: dp_rank=%s role=%s num_tokens=%s",
-                self.dp_rank, _hang_role, num_tokens,
-            )
             num_tokens_after_padding = torch.tensor([num_tokens] * self.dp_size, device="cpu", dtype=torch.int32)
             return num_tokens, num_tokens_after_padding, cudagraph_mode
 
-        packed_tensor = torch.zeros(2, self.dp_size, device="cpu", dtype=torch.int32)
+        packed_tensor = torch.zeros(3, self.dp_size, device="cpu", dtype=torch.int32)
         packed_tensor[0][self.dp_rank] = num_tokens
         packed_tensor[1][self.dp_rank] = cudagraph_mode.value
-        import sys as _hang_sys
-        try:
-            from vllm_ascend.ops.fused_moe.prepare_finalize import _HANG_STATE as _hang_st
-            _hang_ft = _hang_st.get("fwd_type", "?")
-        except Exception:
-            _hang_ft = "?"
-        logger.error(
-            "[HANG] sync_metadata all_reduce ENTER: dp_rank=%s role=%s dp_group_ws=%s num_tokens=%s fwd_type=%s",
-            self.dp_rank, _hang_role, get_dp_group().world_size, num_tokens, _hang_ft,
-        )
-        _hang_sys.stderr.flush()
+        packed_tensor[2][self.dp_rank] = self._dp_batch_type_id
         dist.all_reduce(packed_tensor, group=get_dp_group().cpu_group)
-        logger.error(
-            "[HANG] sync_metadata all_reduce EXIT: dp_rank=%s role=%s max_tokens=%s",
-            self.dp_rank, _hang_role, int(packed_tensor[0, :].max().item()),
-        )
-        _hang_sys.stderr.flush()
+
+        # Extract peer's batch_type_id (for DUMMY to match real's segment)
+        self._peer_batch_type_id = int(packed_tensor[2, 1 - self.dp_rank].item())
 
         # Unpack the results
         num_tokens_across_dp = packed_tensor[0, :]
@@ -2404,11 +2387,16 @@ class NPUModelRunner(GPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
         layer_slice_info: Any = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        try:
-            from vllm_ascend.ops.fused_moe.prepare_finalize import _HANG_STATE as _hang_st
-            _hang_st["fwd_type"] = str(scheduler_output.batch_type)
-        except Exception:
-            pass
+        # PD-separation: encode batch_type for cross-DP sync (0=EMPTY,
+        # 1=PF, 2=PL, 3=DF, 4=DL). Packed into sync_metadata all_reduce
+        # so the idle DP's DUMMY can match this forward's segment.
+        _bt_map = {
+            BatchType.EMPTY: 0, BatchType.PREFILL_FIRST: 1,
+            BatchType.PREFILL_LAST: 2, BatchType.DECODE_FIRST: 3,
+            BatchType.DECODE_LAST: 4,
+        }
+        self._dp_batch_type_id = _bt_map.get(scheduler_output.batch_type, 0)
+
         if self.vllm_config.model_config.enable_return_routed_experts:
             if vllm_version_is("0.20.2"):
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -5328,11 +5316,6 @@ class NPUModelRunner(GPUModelRunner):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
-        try:
-            from vllm_ascend.ops.fused_moe.prepare_finalize import _HANG_STATE as _hang_st
-            _hang_st["fwd_type"] = "DUMMY"
-        except Exception:
-            pass
         # If cudagraph_mode.decode_mode() == FULL and
         # cudagraph_mode.separate_routine(). This means that we are using
         # different graphs and/or modes for mixed prefill-decode batches vs.
@@ -5377,6 +5360,7 @@ class NPUModelRunner(GPUModelRunner):
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
+        self._dp_batch_type_id = 0  # DUMMY
         _cudagraph_mode, batch_desc, _, num_tokens_across_dp, _ = self._determine_batch_execution_and_padding(
             num_tokens=num_tokens_unpadded,
             num_reqs=num_reqs,
@@ -5594,56 +5578,73 @@ class NPUModelRunner(GPUModelRunner):
                 if hasattr(self.drafter, "model") and hasattr(self.drafter.model, "compute_logits"):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
-            with set_ascend_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                in_profile_run=is_profile,
-                num_actual_tokens=num_tokens_padded,
-                aclgraph_runtime_mode=cudagraph_runtime_mode,
-                batch_descriptor=batch_desc,
-                model_instance=self.model,
-                has_sinks = self._has_sinks,
-                input_ids=input_ids,
-            ):
-                outputs = self._model_forward(
-                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
-                )
-            if self.use_aux_hidden_state_outputs:
-                hidden_states, _ = outputs
-            elif isinstance(outputs, IntermediateTensors):
-                hidden_states = outputs["hidden_states"]
-            else:
-                hidden_states = outputs
-            dummy_compute_logits(hidden_states)
+            # PD-separation: DUMMY matches real DP's segment (head or tail).
+            # If peer runs head (PF/DF), DUMMY runs head only (segment_a).
+            # If peer runs tail (PL/DL), DUMMY runs tail only (segment_e).
+            # This ensures 1:1 all_gather pairing (1 per DUMMY, 1 per real).
+            hidden_states = None
+            _skip_head = False
+            _skip_tail = False
+            if is_edge_device() and not is_profile:
+                _peer_bt = self._peer_batch_type_id
+                if _peer_bt in (2, 4):  # peer is tail (PL/DL)
+                    _skip_head = True
+                elif _peer_bt in (1, 3):  # peer is head (PF/DF)
+                    _skip_tail = True
 
-            if self.drafter:
-                self.drafter.dummy_run(
+            if not _skip_head:
+                with set_ascend_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
                     num_tokens=num_tokens_padded,
-                    with_prefill=with_prefill,
-                    num_reqs=num_reqs_padded,
                     num_tokens_across_dp=num_tokens_across_dp,
+                    in_profile_run=is_profile,
+                    num_actual_tokens=num_tokens_padded,
                     aclgraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_desc,
-                    dummy_compute_logits=dummy_drafter_compute_logits,
-                    in_graph_capturing=not force_attention,
-                    is_profile=is_profile,
-                )
-            if is_profile and self.dynamic_eplb:
-                target = self.model.language_model if hasattr(self.model, "language_model") else self.model
-                target.clear_all_moe_loads()
-            if self.dynamic_eplb:
-                self.eplb_updator.forward_end()
-            self._finalize_dump_data(dump=False)
-            if self.use_compress and force_attention:
-                self.positions.fill_(0)
-                self._dsa_positions_cpu_buf.fill_(0)
+                    model_instance=self.model,
+                    has_sinks = self._has_sinks,
+                    input_ids=input_ids,
+                ):
+                    outputs = self._model_forward(
+                        num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
+                    )
+                if self.use_aux_hidden_state_outputs:
+                    hidden_states, _ = outputs
+                elif isinstance(outputs, IntermediateTensors):
+                    hidden_states = outputs["hidden_states"]
+                else:
+                    hidden_states = outputs
+                dummy_compute_logits(hidden_states)
+
+                if self.drafter:
+                    self.drafter.dummy_run(
+                        num_tokens=num_tokens_padded,
+                        with_prefill=with_prefill,
+                        num_reqs=num_reqs_padded,
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        aclgraph_runtime_mode=cudagraph_runtime_mode,
+                        batch_descriptor=batch_desc,
+                        dummy_compute_logits=dummy_drafter_compute_logits,
+                        in_graph_capturing=not force_attention,
+                        is_profile=is_profile,
+                    )
+                if is_profile and self.dynamic_eplb:
+                    target = self.model.language_model if hasattr(self.model, "language_model") else self.model
+                    target.clear_all_moe_loads()
+                if self.dynamic_eplb:
+                    self.eplb_updator.forward_end()
+                self._finalize_dump_data(dump=False)
+                if self.use_compress and force_attention:
+                    self.positions.fill_(0)
+                    self._dsa_positions_cpu_buf.fill_(0)
+            else:
+                outputs = None
 
             # ========== Edge 设备特殊处理：Edge 首阶段需要执行最后一层 ==========
-            if is_edge_device():
-                # 断言：边设备输出必须是 IntermediateTensors 类型
-                assert isinstance(outputs, IntermediateTensors)
+            if is_edge_device() and not _skip_tail:
+                if outputs is not None:
+                    assert isinstance(outputs, IntermediateTensors)
 
                 # 重新准备 intermediate_tensors（与上文逻辑相同）
                 intermediate_tokens = num_tokens_padded
