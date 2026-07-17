@@ -744,13 +744,9 @@ class NPUWorker(WorkerBase):
         # (total_num_scheduled_tokens == 0). is_pd_dummy dynamic attr is
         # lost during zmq serialization, so use the native field instead.
         if scheduler_output.total_num_scheduled_tokens == 0:
-            logger.error(
-                "[HANG] cloud _execute_model_cloud dummy-middle: dp_rank=%s",
-                getattr(self.model_runner, "dp_rank", "?"),
-            )
             self.model_runner._dummy_run(
                 num_tokens=self.model_runner.decode_token_per_req,
-                uniform_decode=True,
+                uniform_decode=False,
             )
             return None
         logger.info(
@@ -1224,12 +1220,13 @@ class NPUWorker(WorkerBase):
         self.model_runner.reset_encoder_cache()
 
     def execute_dummy_batch(self) -> None:
-        logger.error(
-            "[HANG] worker.execute_dummy_batch: dp_rank=%s role=%s",
-            getattr(self.model_runner, "dp_rank", "?"),
-            getattr(getattr(self.model_runner, "edge_cloud_cfg", None), "role", "?"),
-        )
-        self.model_runner._dummy_run(num_tokens=self.model_runner.decode_token_per_req, uniform_decode=True)
+        # PD-separation: use uniform_decode=False (prefill-style attention)
+        # instead of True (decode-style). Decode attention reads from the KV
+        # cache which has real data from previous forwards, causing softmax
+        # overflow -> NaN when the dummy's query (from zero input) interacts
+        # with large real KV values. Prefill-style attention is causal (only
+        # writes KV, doesn't read), avoiding the NaN.
+        self.model_runner._dummy_run(num_tokens=self.model_runner.decode_token_per_req, uniform_decode=False)
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
