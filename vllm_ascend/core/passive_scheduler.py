@@ -123,6 +123,7 @@ class PassiveScheduler:
         run_subscriber_thread: bool = True,
     ) -> None:
         self.pp_subscriber = pp_subscriber
+        self.vllm_config = vllm_config
         self.dispatch_policy = dispatch_policy
         self.cloud_scheduling_state = CloudSchedulingState.EXPECT_EXECUTE_PREFILL
 
@@ -269,10 +270,40 @@ class PassiveScheduler:
                 break
             self._remember_arrival_seq(scheduler_output, seq)
             bt = scheduler_output.batch_type
+            # [DPDBG] classify dummy vs real prefill/decode. The dummy zmq
+            # (from _patched_execute_dummy_batch / _publish_pd_dummy_zmq) is
+            # published with batch_type=DECODE_FIRST but
+            # total_num_scheduled_tokens==0 (the is_pd_dummy attr is lost in
+            # zmq serialization, so the cloud detects dummy by tokens==0).
+            # Distinguish so the dummy-flood vs real-request arrival counts per
+            # cloud DP are visible: the dp=2 PP-init-timeout symptom is one
+            # cloud DP seeing far more dummies before its real PREFILL_FIRST
+            # than the other (e.g. seq=282 vs 68 for the real PREFILL_FIRST).
+            _total = scheduler_output.total_num_scheduled_tokens
+            if _total == 0:
+                _kind = "DUMMY"
+            elif bt in (BatchType.PURE_PREFILL, BatchType.PREFILL_FIRST):
+                _kind = "REAL_PREFILL"
+            elif bt in (BatchType.PURE_DECODE, BatchType.DECODE_FIRST):
+                _kind = "REAL_DECODE"
+            elif bt in (BatchType.PREFILL_LAST, BatchType.DECODE_LAST):
+                _kind = "TAIL(edge-only)"
+            else:
+                _kind = f"OTHER({bt.value if bt is not None else None})"
+            _kc = getattr(self, "_dpdbg_kind_count", None)
+            if _kc is None:
+                _kc = {}
+                self._dpdbg_kind_count = _kc
+            _kc[_kind] = _kc.get(_kind, 0) + 1
+            _dp_rank = getattr(
+                getattr(self.vllm_config, "parallel_config", None),
+                "data_parallel_rank", "?",
+            )
             logger.info(
-                "Received scheduler_output from edge, seq=%d, batch_type: %s",
-                seq,
-                bt,
+                "[DPDBG] PassiveScheduler recv: dp_rank=%s seq=%s kind=%s "
+                "batch_type=%s tokens=%s kind_counts=%s",
+                _dp_rank, seq, _kind,
+                bt.value if bt is not None else None, _total, _kc,
             )
             if bt == BatchType.EMPTY:
                 continue
