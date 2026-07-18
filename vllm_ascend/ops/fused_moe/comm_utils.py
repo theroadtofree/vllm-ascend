@@ -19,11 +19,32 @@ import torch
 import torch.distributed
 import torch.distributed as dist
 import torch_npu
+from vllm.logger import logger as _logger
 
 COMM_STREAM = None
 
+# [DPDBG] running per-rank counter of MoE all-toall ops. Used to detect
+# cross-DP all-toall count divergence between cloud DPs (the dp=2 MoE
+# PP-init-timeout symptom: cloud rank1 stuck in a dummy's all-toall while
+# peer cloud rank6 is at a different all-toall index). Increment on every
+# MoE all-toall (MC2 dispatch and All2All) so the index is monotonic and
+# comparable across DPs. Log only count + global rank so rank1 (dp0 cloud)
+# vs rank6 (dp1 cloud) sequences can be diffed with: grep "[DPDBG] moe_a2a"
+_DPDBG_A2A_COUNT = 0
+
+
+def dpdbg_moe_a2a_tick(label: str = "a2a"):
+    global _DPDBG_A2A_COUNT
+    _DPDBG_A2A_COUNT += 1
+    try:
+        _rank = dist.get_rank() if dist.is_initialized() else -1
+    except Exception:
+        _rank = -1
+    _logger.error("[DPDBG] moe_a2a %s: rank=%s count=%s", label, _rank, _DPDBG_A2A_COUNT)
+
 
 def async_all_to_all(input_, output_split_sizes, input_split_sizes, group, event=None):
+    dpdbg_moe_a2a_tick("a2a")
     if output_split_sizes is None:
         # Equal split (all2all)
         a2a_out = torch.empty_like(input_)
