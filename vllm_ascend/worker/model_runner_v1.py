@@ -1309,6 +1309,24 @@ class NPUModelRunner(GPUModelRunner):
         # Extract peer's batch_type_id (for DUMMY to match real's segment)
         self._peer_batch_type_id = int(packed_tensor[2, 1 - self.dp_rank].item())
 
+        # [DPDBG] trace sync_metadata pairing to locate cross-DP misalignment.
+        # Compare rank1 (cloud dp0) vs rank6 (cloud dp1) call sequences: the
+        # all_reduce is a barrier so call N on both sides must pair. my_bt=0
+        # means this side is a DUMMY, 1/2/3/4 = real PF/PL/DF/DL. peer_bt is
+        # what the OTHER cloud contributed this round.
+        _smc = getattr(self, "_sync_meta_count", 0) + 1
+        self._sync_meta_count = _smc
+        try:
+            _sm_rank = dist.get_rank()
+        except Exception:
+            _sm_rank = -1
+        logger.error(
+            "[DPDBG] sync_meta: rank=%s dp_rank=%s call=%s my_bt=%s peer_bt=%s "
+            "num_tokens=%s",
+            _sm_rank, self.dp_rank, _smc, self._dp_batch_type_id,
+            self._peer_batch_type_id, num_tokens,
+        )
+
         # Unpack the results
         num_tokens_across_dp = packed_tensor[0, :]
         max_tokens_across_dp = int(num_tokens_across_dp.max().item())
