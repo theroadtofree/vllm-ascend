@@ -51,13 +51,14 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.logger import logger
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     ModelRunnerOutput,
 )
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
+from vllm_ascend.device_allocator.camem import CaMemAllocator
 
 from vllm_ascend.distributed.parallel_state import (
     edge_cloud_broadcast_recv,
@@ -827,6 +828,19 @@ class SharedModelEdgeWorker(NPUWorker):
         leader has already assigned :attr:`_shared_model` by the time
         followers need it. There is no polling — followers read
         ``_shared_model`` directly.
+
+        The follower branch wraps ``bind_to_shared_model`` in the same
+        ``with context, set_current_vllm_config(self.vllm_config)`` pair
+        used by :meth:`NPUWorker.load_model` (see
+        [worker.py:696-707](vllm-ascend/vllm_ascend/worker/worker.py#L696-L707))
+        so the runner's post-binding side effects (``drafter.load_model``,
+        ``ACLGraphWrapper`` construction, profiler dump) read this
+        follower's own ``vllm_config`` and run inside the weight memory
+        pool if sleep-mode is enabled — matching what the leader's
+        :meth:`NPUWorker.load_model` does for ``load_model`` itself.
+        The leader branch delegates to ``super().load_model()`` which
+        already wraps ``self.model_runner.load_model()`` in the same
+        pair, so no extra wrapping is needed there.
         """
         if self._is_leader:
             super().load_model()
@@ -840,7 +854,18 @@ class SharedModelEdgeWorker(NPUWorker):
                     "in local_rank order so the leader's load_model runs "
                     "before any follower's."
                 )
-            self.model_runner.bind_to_shared_model(leader._shared_model)
+            if self.vllm_config.model_config.enable_sleep_mode:
+                allocator = CaMemAllocator.get_instance()
+                assert (
+                    allocator.get_current_usage() == 0
+                ), "Sleep mode can only be used for one instance per process."
+                context = allocator.use_memory_pool(tag="weights")
+            else:
+                from contextlib import nullcontext
+
+                context = nullcontext()  # type: ignore
+            with context, set_current_vllm_config(self.vllm_config):
+                self.model_runner.bind_to_shared_model(leader._shared_model)
             self._shared_model = leader._shared_model
             # Inherit the leader's measured model memory usage so that
             # determine_available_memory can correctly subtract the
