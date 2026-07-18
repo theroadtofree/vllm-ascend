@@ -1497,14 +1497,15 @@ def edge_cloud_send_tensor_dict_scheduled_draft(
     tensor_dict: dict[str, torch.Tensor | Any],
     channel: HiddenChannelType = HiddenChannelType.DECODE,
     tensor_meta: ScheduledDraftTensorMeta | None = None,
+    dst: int | None = None,
 ) -> list[Handle]:
     """Send a scheduled draft payload, avoiding metadata sync when possible."""
     pp_group = get_pp_group()
     if tensor_meta is not None:
         if pp_group.world_size <= 1:
             return []
-
-        dst = (pp_group.rank_in_group + 1) % pp_group.world_size
+        if dst is None:
+            dst = (pp_group.rank_in_group + 1) % pp_group.world_size
         group = _get_edge_cloud_hidden_channel_device_group(
             pp_group,
             channel=channel,
@@ -1562,10 +1563,10 @@ def edge_cloud_send_tensor_dict_scheduled_draft(
     if hasattr(pp_group, "isend_tensor_dict_on_hidden_channel"):
         return pp_group.isend_tensor_dict_on_hidden_channel(
             tensor_dict,
-            dst=None,
+            dst=dst,
             channel=channel,
         )
-    return pp_group.isend_tensor_dict(tensor_dict)
+    return pp_group.isend_tensor_dict(tensor_dict, dst=dst)
 
 
 def _apply_sp_chunk_inplace(tensor_dict: dict[str, Any]) -> None:
@@ -1779,7 +1780,7 @@ def edge_cloud_broadcast_recv(
     return recv_tensor_dict, [], [broadcast_postprocess]
 
 
-def edge_cloud_broadcast_recv_draft() -> tuple[
+def edge_cloud_broadcast_recv_draft(src: int | None = None) -> tuple[
     dict[str, torch.Tensor | Any] | None,
     list[Handle],
     list[Callable[[], None]],
@@ -1800,10 +1801,10 @@ def edge_cloud_broadcast_recv_draft() -> tuple[
     """
     pp_group = get_pp_group()
     tp_group = get_tp_group()
-    is_pp_npu0 = pp_group.world_size == 2
+    is_pp_npu0 = pp_group.world_size > 1
 
     if is_pp_npu0:
-        tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict()
+        tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict(src=src)
         assert tensor_dict is not None, (
             "edge_cloud_broadcast_recv_draft: PP tensor_dict is None, "
             "sender may have failed."
@@ -1862,6 +1863,7 @@ def edge_cloud_broadcast_recv_draft() -> tuple[
 def edge_cloud_broadcast_recv_scheduled_draft(
     channel: HiddenChannelType = HiddenChannelType.DECODE,
     tensor_meta: ScheduledDraftTensorMeta | None = None,
+    src: int | None = None,
 ) -> tuple[
     dict[str, torch.Tensor | Any] | None,
     list[Handle],
@@ -1875,7 +1877,7 @@ def edge_cloud_broadcast_recv_scheduled_draft(
     """
     pp_group = get_pp_group()
     tp_group = get_tp_group()
-    is_pp_npu0 = pp_group.world_size == 2
+    is_pp_npu0 = pp_group.world_size > 1
 
     if tensor_meta is not None:
         recv_tensor_dict: dict[str, torch.Tensor | Any] = {}
@@ -1891,7 +1893,8 @@ def edge_cloud_broadcast_recv_scheduled_draft(
 
         comm_handles: list[Handle] = []
         if is_pp_npu0:
-            src = (pp_group.rank_in_group - 1) % pp_group.world_size
+            if src is None:
+                src = (pp_group.rank_in_group - 1) % pp_group.world_size
             group = _get_edge_cloud_hidden_channel_device_group(
                 pp_group,
                 channel=channel,
@@ -1946,13 +1949,13 @@ def edge_cloud_broadcast_recv_scheduled_draft(
         if hasattr(pp_group, "irecv_tensor_dict_on_hidden_channel"):
             tensor_dict, comm_handles, comm_postprocess = (
                 pp_group.irecv_tensor_dict_on_hidden_channel(
-                    src=None,
+                    src=src,
                     channel=channel,
                 )
             )
         else:
             tensor_dict, comm_handles, comm_postprocess = (
-                pp_group.irecv_tensor_dict()
+                pp_group.irecv_tensor_dict(src=src)
             )
         assert tensor_dict is not None, (
             "edge_cloud_broadcast_recv_scheduled_draft: PP tensor_dict is None, "

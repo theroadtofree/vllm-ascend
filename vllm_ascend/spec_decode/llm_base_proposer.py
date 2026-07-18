@@ -117,6 +117,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_states_to_model: bool, runner=None):
         super().__init__(vllm_config, device, pass_hidden_states_to_model, runner=runner)
+        self.local_rank = getattr(runner, 'local_rank', 0)
 
         # Assign runner before it's used in the methods below
         self.runner = runner
@@ -2109,17 +2110,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 output["spec_step_idx"] = torch.tensor(
                     0, dtype=torch.int64, device="cpu"
                 )
-            if get_pp_group().world_size == 2:
+            if get_pp_group().world_size > 1:
                 send_work = get_pp_group().isend_tensor_dict(
                     {k: v.contiguous() if isinstance(v, torch.Tensor) else v
-                     for k, v in output.items()}
+                     for k, v in output.items()}, dst=self.local_rank + 1
                 )
                 for handle in send_work:
                     handle.wait()
 
             # Receive cloud segment result (all decoder layers run on cloud)
             tensor_dict, comm_handles, comm_postprocess = (
-                edge_cloud_broadcast_recv_draft()
+                edge_cloud_broadcast_recv_draft(src=self.local_rank + 1)
             )
             for handle in comm_handles:
                 handle.wait()
@@ -2149,7 +2150,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # sample_tokens returns None before calling _run_merged_draft.
             # Kept here as a fallback if the calling context changes.
             tensor_dict, comm_handles, comm_postprocess = (
-                edge_cloud_broadcast_recv_draft()
+                edge_cloud_broadcast_recv_draft(src=0)
             )
             for handle in comm_handles:
                 handle.wait()
@@ -2245,10 +2246,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 output = segments["c"](**model_kwargs)
             assert isinstance(output, IntermediateTensors)
 
-            if get_pp_group().world_size == 2:
+            if get_pp_group().world_size > 1:
                 send_work = get_pp_group().isend_tensor_dict(
                     {k: v.contiguous() if isinstance(v, torch.Tensor) else v
-                     for k, v in output.items()}
+                     for k, v in output.items()}, dst=0
                 )
                 for handle in send_work:
                     handle.wait()

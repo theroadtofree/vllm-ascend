@@ -1137,6 +1137,7 @@ class NPUWorker(WorkerBase):
         tensor_dict, comm_handles, comm_postprocess = (
             edge_cloud_broadcast_recv_scheduled_draft(
                 tensor_meta=recv_tensor_meta,
+                src=0,
             )
         )
         for handle in comm_handles:
@@ -1147,7 +1148,7 @@ class NPUWorker(WorkerBase):
         output = self.model_runner._run_edge_cloud_draft_middle_segment(
             scheduler_output, IntermediateTensors(tensor_dict)
         )
-        if get_pp_group().world_size == 2:
+        if get_pp_group().world_size > 1:
             out_tensor_dict = {
                 key: value.contiguous()
                 if isinstance(value, torch.Tensor)
@@ -1163,6 +1164,7 @@ class NPUWorker(WorkerBase):
                 edge_cloud_send_tensor_dict_scheduled_draft(
                     out_tensor_dict,
                     tensor_meta=send_tensor_meta,
+                    dst=0,
                 ),
                 channel=HiddenChannelType.DECODE,
             )
@@ -1189,7 +1191,7 @@ class NPUWorker(WorkerBase):
         )
         if not isinstance(output, IntermediateTensors):
             raise RuntimeError("DRAFT_FIRST did not produce intermediates")
-        if get_pp_group().world_size == 2:
+        if get_pp_group().world_size > 1:
             tensor_dict = {
                 key: value.contiguous()
                 if isinstance(value, torch.Tensor)
@@ -1204,6 +1206,7 @@ class NPUWorker(WorkerBase):
                 edge_cloud_send_tensor_dict_scheduled_draft(
                     tensor_dict,
                     tensor_meta=send_tensor_meta,
+                    dst=self.local_rank + 1 if self.parallel_config.is_shared_model_edge else 1,
                 ),
                 channel=HiddenChannelType.DECODE,
             )
@@ -1229,6 +1232,7 @@ class NPUWorker(WorkerBase):
         tensor_dict, comm_handles, comm_postprocess = (
             edge_cloud_broadcast_recv_scheduled_draft(
                 tensor_meta=recv_tensor_meta,
+                src=self.local_rank + 1 if self.parallel_config.is_shared_model_edge else 1,
             )
         )
         for handle in comm_handles:

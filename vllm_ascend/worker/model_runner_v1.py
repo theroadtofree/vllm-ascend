@@ -3936,9 +3936,9 @@ class NPUModelRunner(GPUModelRunner):
                 and self._last_scheduler_output is not None
             ):
                 pp_group = get_pp_group()
-                if pp_group.world_size == 2:
+                if pp_group.world_size > 1:
                     tensor_dict, recv_handles, recv_postprocess = (
-                        pp_group.irecv_tensor_dict()
+                        pp_group.irecv_tensor_dict(src=0)
                     )
                     for handle in recv_handles:
                         handle.wait()
@@ -4266,8 +4266,9 @@ class NPUModelRunner(GPUModelRunner):
                             else None
                         ),
                     }
-                elif get_pp_group().world_size == 2:
-                    send_work = get_pp_group().isend_tensor_dict(tensor_dict_to_send)
+                elif get_pp_group().world_size > 1:
+                    send_work = get_pp_group().isend_tensor_dict(tensor_dict_to_send,
+                        dst=getattr(self, 'local_rank', 0) + 1)
                     for handle in send_work:
                         handle.wait()
 

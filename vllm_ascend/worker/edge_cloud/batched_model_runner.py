@@ -28,6 +28,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from vllm.config import CUDAGraphMode
+from vllm.config.vllm import VllmConfig
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_pp_group
@@ -134,6 +135,10 @@ class BatchedModelRunner(NPUModelRunner):
     # have these attributes; the subclass adds them.
     _KV_CACHE_CONFIGS_PER_DP_RANK: "dict[int, KVCacheConfig]" = {}
     _KV_CACHE_CONSTRUCTED: bool = False
+
+    def __init__(self, vllm_config: VllmConfig, device: torch.device, local_rank: int = 0):
+        self.local_rank = local_rank
+        super().__init__(vllm_config, device)
 
     # ------------------------------------------------------------------
     # KV cache init (overridden): edge-cloud head_tail coordination
@@ -1425,11 +1430,37 @@ class BatchedModelRunner(NPUModelRunner):
             )
 
         # ---- Decode-first perm computation.
-        # A req is classified as **prefill** iff ``query_len > 1
-        # OR is_prefilling`` (matches
-        # ``split_decodes_and_prefills`` with
-        # ``decode_threshold = 1`` and
-        # ``treat_short_extends_as_decodes=False``).
+        # A req is classified as **prefill** iff
+        # ``merged_is_prefilling[i]`` is set (sourced from
+        # ``num_computed_tokens_cpu < num_prompt_tokens_cpu`` per
+        # [model_runner_v1.py:4378](vllm-ascend/vllm_ascend/worker/model_runner_v1.py#L4378)
+        # at per-dp_rank ``_build_attention_metadata`` time). The
+        # ``(query_lens > 1)`` operand that previously OR'd here
+        # was redundant in the only spec-decoding mixed path that
+        # reaches this helper: for every
+        # ``SpecDecoding ⊔ {ChunkedPrefill, PrefillNoCache}`` the
+        # merged attn-state collapse at lines 1626-1636 routes the
+        # merge to ``ChunkedPrefill`` (forcing reorder), and every
+        # SpecDecoding req has ``num_valid_tokens == 1`` per
+        # [model_runner_v1.py:1840-1844](vllm-ascend/vllm_ascend/worker/model_runner_v1.py#L1840-L1844)
+        # hence ``num_scheduled == 1 + num_drafts >= 2``, so the
+        # query-length operand would already be True for the
+        # whole SpecDecoding segment; the OR added no
+        # decode-vs-prefill information. GDN builder's
+        # spec-path num_decodes / num_prefills is computed
+        # independently from ``spec_sequence_masks`` and
+        # ``query_lens`` at
+        # [gdn_attn.py:213-222](vllm/vllm/v1/attention/backends/gdn_attn.py#L213-L222)
+        # (and only the ``spec_sequence_masks is None`` branch
+        # at line 199 calls into ``split_decodes_and_prefills``,
+        # which would otherwise be the vLLM-side ``is_prefill |=
+        # is_prefilling`` analogue at
+        # [utils.py:551-555](vllm/vllm/v1/attention/backends/utils.py#L551-L555)).
+        # ``merged_query_lens_cpu_actual`` is still materialised
+        # here because the reorder perm ``merged_perm`` needs it
+        # at line 1521 to recompute ``merged_query_start_loc_cpu``
+        # in decode-first order; only the prefill-classification
+        # vector drops the ``query_lens`` operand.
         # Padded rows (idx >= merged_num_reqs) are appended
         # AFTER prefill rows so the kernel's ``first_prefill``
         # correctly identifies the decode/prefill boundary.
@@ -1438,8 +1469,7 @@ class BatchedModelRunner(NPUModelRunner):
             - merged_query_start_loc_cpu[:merged_num_reqs])
         if merged_is_prefilling is not None:
             is_prefill_merged_actual = (
-                (merged_query_lens_cpu_actual > 1)
-                | merged_is_prefilling[:merged_num_reqs])
+                merged_is_prefilling[:merged_num_reqs])
         else:
             is_prefill_merged_actual = (
                 merged_query_lens_cpu_actual > 1)
@@ -1627,16 +1657,36 @@ class BatchedModelRunner(NPUModelRunner):
 
         states = [cm.attn_state for cm in cms_unpadded]
         unique_states = set(states)
-        if len(unique_states) > 1:
-            if AscendAttentionState.SpecDecoding in unique_states:
-                raise NotImplementedError(
-                    "Cannot merge SpecDecoding with other states "
-                    f"{unique_states}; SpecDecoding uses a "
-                    "separate tree path that the batched forward "
-                    "does not yet support.")
-            merged_attn_state = AscendAttentionState.ChunkedPrefill
-        else:
+        if len(unique_states) == 1:
             merged_attn_state = next(iter(unique_states))
+        elif unique_states <= {AscendAttentionState.DecodeOnly,
+                               AscendAttentionState.SpecDecoding}:
+            # DecodeOnly ⊔ SpecDecoding are treated identically by
+            # AscendSFAImpl / AscendMLAImpl / AscendDSAImpl /
+            # AscendDSACPImpl build paths (they key on
+            # ``attn_state in {DecodeOnly, SpecDecoding}`` — see
+            # sfa_v1.py:355 / mla_v1.py:667 / dsa_v1.py:1332 /
+            # dsa_cp.py:852). Picking SpecDecoding here keeps
+            # spec-aware forward and avoids the prefill-like
+            # ``else`` branch which assumes >= 2-token queries.
+            # The GDN builder additionally still receives
+            # spec-decoding fields through
+            # ``merged_extra_args`` below (line 2213-2252),
+            # derived from ``num_decode_draft_tokens_cpu`` (which
+            # has no attn_state dependency — see
+            # gdn_attn.py:178-313).
+            merged_attn_state = AscendAttentionState.SpecDecoding
+        else:
+            # Any mixed set that includes a prefill state
+            # (``ChunkedPrefill`` / ``PrefillNoCache``) collapses
+            # to ``ChunkedPrefill``. The per-dp_rank
+            # ``_build_attn_state`` already guarantees the merged
+            # ``np.all(num_computed_tokens_cpu == 0)`` cannot hold
+            # (any decode-bearing dp_rank has ``num_computed > 0``)
+            # when the merged batch includes decode-class dp_ranks,
+            # so ``PrefillNoCache`` is unreachable here — keep it
+            # exclusively for the single-state branch above.
+            merged_attn_state = AscendAttentionState.ChunkedPrefill
         logger.info("[PD] _get_or_build_merged_attn_ctx: Step 1 scalars done merged_num_actual_tokens=%d merged_num_reqs=%d", merged_num_actual_tokens, merged_num_reqs)
 
         # ---- Step 2: dispatch the merged batch to get the merged
@@ -1802,7 +1852,11 @@ class BatchedModelRunner(NPUModelRunner):
         # that case and produces identity perm tensors so the
         # downstream permute calls below stay uniform.
         need_reorder = (
-            merged_attn_state != AscendAttentionState.DecodeOnly)
+            merged_attn_state
+            not in (
+                AscendAttentionState.DecodeOnly,
+                AscendAttentionState.SpecDecoding,
+            ))
         logger.info(
             "[PD] _get_or_build_merged_attn_ctx: "
             "calling _apply_decode_first_reorder "
@@ -2266,67 +2320,146 @@ class BatchedModelRunner(NPUModelRunner):
                 # ``(cascade_attn_prefix_len,
                 # extra_attn_metadata_args)`` tuple saved by
                 # ``_build_attn_group_metadata``).
+                #
+                # Per-dp_rank pipelines can each populate a
+                # different subset of ``extra_attn_metadata_args``
+                # keys (e.g. only the GDN+spec-bearing dp_rank
+                # carries ``num_accepted_tokens`` /
+                # ``num_decode_draft_tokens_cpu``; a dp_rank with
+                # DSA backends carries DSA-specific keys). The
+                # union of those keys is what the merged builder
+                # must receive, so we first union the keys over
+                # all bundles and then compute ``merged_extra_args``
+                # key-by-key (instead of iterating the first
+                # bundle's key order — which silently drops keys
+                # present only in later bundles).
+                # Materialise the per-bundle ``(cascade_attn_prefix_len,
+                # extra_attn_metadata_args)`` tuple once so the
+                # key-by-key loop only pays for ``NB`` indexing
+                # lookups total (instead of ``NB`` per key).
+                per_bundle_extra_args = [
+                    b.per_gid_extra[(kv_cache_gid, attn_gid)]
+                    for b in bundles]
                 merged_cascade_attn_prefix_len = 0
-                merged_extra_args: dict[str, Any] = {}
-                for b in bundles:
-                    cascade_attn_prefix_len, extra_args = (
-                        b.per_gid_extra[(kv_cache_gid, attn_gid)])
+                for cascade_attn_prefix_len, _ in (
+                        per_bundle_extra_args):
                     merged_cascade_attn_prefix_len += (
                         cascade_attn_prefix_len)
-                    for k_key, v in extra_args.items():
-                        if k_key in ("num_accepted_tokens",
-                                     "num_decode_draft_tokens_cpu"):
-                            tensors = [
-                                b2.per_gid_extra[
-                                    (kv_cache_gid, attn_gid)][1].get(
-                                        k_key)
-                                for b2 in bundles
-                                if b2.per_gid_extra[(
-                                    kv_cache_gid, attn_gid)][1].get(
-                                        k_key) is not None]
-                            t_cat = torch.cat(
-                                [t[:b2.num_reqs_actual]
-                                 for t, b2 in zip(tensors, bundles)],
-                                dim=0)
-                            if (t_cat.shape[0]
-                                    < merged_num_reqs_padded):
-                                pad = torch.zeros(
-                                    merged_num_reqs_padded
-                                    - t_cat.shape[0],
-                                    dtype=t_cat.dtype,
-                                    device=t_cat.device)
-                                t_cat = torch.cat([t_cat, pad])
-                            elif t_cat.shape[0] > merged_num_reqs_padded:
-                                t_cat = t_cat[:merged_num_reqs_padded]
-                            # Decode-first reorder: per-req
-                            # extra args must follow the merged
-                            # batch layout. In DecodeOnly mode
-                            # the perm is the identity map so
-                            # the slice is skipped.
-                            if need_reorder:
-                                t_cat = t_cat[merged_perm]
-                            merged_extra_args[k_key] = (
-                                t_cat.contiguous())
-                        elif k_key == "num_reqs_actual":
-                            # DSA scalar: sum across dp_ranks.
-                            merged_extra_args[k_key] = (
-                                merged_extra_args.get(k_key, 0) + v)
-                        elif k_key in ("compress_ratio", "block_size"):
-                            # DSA scalar: take-first (uniform).
-                            merged_extra_args.setdefault(k_key, v)
-                        elif k_key.endswith("_ratio_to_sas_metadata"):
-                            # DSA per-builder state: not supported
-                            # in the batched path.
-                            raise NotImplementedError(
-                                f"Layer {attn_group.layer_names[0]}: "
-                                f"DSA {k_key!r} is set on dp_rank "
-                                f"bundle; the batched forward "
-                                f"does not yet support merging "
-                                f"per-builder ratio metadata.")
+                # Union of keys across all bundles.
+                extra_args_keys: set[str] = set()
+                for _, extra_args in per_bundle_extra_args:
+                    extra_args_keys.update(extra_args.keys())
+                merged_extra_args: dict[str, Any] = {}
+                for k_key in extra_args_keys:
+                    if k_key in ("num_accepted_tokens",
+                                 "num_decode_draft_tokens_cpu"):
+                        # Per-req tensor merge: every bundle
+                        # contributes its ``b.num_reqs_actual``
+                        # slice — either its real ``v[k_key]``
+                        # value or, for bundles that did not
+                        # populate the key this round, a default
+                        # tensor of length ``b.num_reqs_actual``
+                        # filled with the per-dp_rank padding
+                        # value (``num_accepted_tokens`` →
+                        # ``1``,
+                        # [model_runner_v1.py:1501](vllm-ascend/vllm_ascend/worker/model_runner_v1.py#L1501);
+                        # ``num_decode_draft_tokens_cpu`` → ``-1``,
+                        # [model_runner_v1.py:1695](vllm-ascend/vllm_ascend/worker/model_runner_v1.py#L1695)).
+                        # Skipping non-populating bundles would
+                        # under-count ``merged_num_reqs`` and
+                        # shift later dp_ranks into the padding
+                        # tail — explicitly forbidden by the
+                        # parallel-FULL cudagraph pinned tail.
+                        # Device convention per key matches the
+                        # single-dp_rank call site at
+                        # [model_runner_v1.py:4445-4446](vllm-ascend/vllm_ascend/worker/model_runner_v1.py#L4445-L4446):
+                        # ``num_accepted_tokens`` on the leader
+                        # runner's NPU, ``num_decode_draft_tokens_cpu``
+                        # on CPU (matches the GDN builder's
+                        # ``num_decode_draft_tokens_cpu`` argument
+                        # name at
+                        # [gdn_attn.py:161](vllm/vllm/v1/attention/backends/gdn_attn.py#L161)).
+                        if k_key == "num_decode_draft_tokens_cpu":
+                            pad_value = -1
+                            tensor_device = "cpu"
                         else:
-                            # Unknown extra arg — pass through the
-                            # first non-None value (defensive).
-                            merged_extra_args.setdefault(k_key, v)
+                            pad_value = 1
+                            tensor_device = self.device
+                        tensors_with_bundles = []
+                        for b, (_, v) in zip(
+                                bundles, per_bundle_extra_args):
+                            t = v.get(k_key)
+                            if t is None:
+                                # Fill the bundle's per-req range
+                                # with the per-dp_rank padding
+                                # value so this bundle still
+                                # contributes ``b.num_reqs_actual``
+                                # rows to the merged tensor at the
+                                # correct position (NOT appended
+                                # to the tail — otherwise later
+                                # dp_ranks would shift into the
+                                # padding tail and break per-req
+                                # alignment with the rest of the
+                                # merged batch).
+                                t = torch.full(
+                                    (b.num_reqs_actual,),
+                                    pad_value,
+                                    dtype=torch.int32,
+                                    device=tensor_device)
+                            else:
+                                t = t[:b.num_reqs_actual]
+                            tensors_with_bundles.append((b, t))
+                        t_cat = torch.cat(
+                            [t for _, t in tensors_with_bundles],
+                            dim=0)
+                        if (t_cat.shape[0]
+                                < merged_num_reqs_padded):
+                            pad = torch.full(
+                                (merged_num_reqs_padded
+                                 - t_cat.shape[0],),
+                                pad_value,
+                                dtype=t_cat.dtype,
+                                device=t_cat.device)
+                            t_cat = torch.cat([t_cat, pad])
+                        elif t_cat.shape[0] > merged_num_reqs_padded:
+                            t_cat = t_cat[:merged_num_reqs_padded]
+                        # Decode-first reorder: per-req extra
+                        # args must follow the merged batch
+                        # layout. In DecodeOnly mode the perm is
+                        # the identity map so the slice is
+                        # skipped.
+                        if need_reorder:
+                            t_cat = t_cat[merged_perm]
+                        merged_extra_args[k_key] = t_cat.contiguous()
+                    elif k_key == "num_reqs_actual":
+                        # DSA scalar: sum across dp_ranks.
+                        merged_extra_args[k_key] = sum(
+                            v.get(k_key, 0) for _, v in
+                            per_bundle_extra_args)
+                    elif k_key in ("compress_ratio", "block_size"):
+                        # DSA scalar: take-first (uniform).
+                        for _, v in per_bundle_extra_args:
+                            if k_key in v:
+                                merged_extra_args.setdefault(
+                                    k_key, v[k_key])
+                                break
+                    elif k_key.endswith("_ratio_to_sas_metadata"):
+                        # DSA per-builder state: not supported in
+                        # the batched path.
+                        raise NotImplementedError(
+                            f"Layer {attn_group.layer_names[0]}: "
+                            f"DSA {k_key!r} is set on dp_rank "
+                            f"bundle; the batched forward "
+                            f"does not yet support merging "
+                            f"per-builder ratio metadata.")
+                    else:
+                        # Unknown extra arg — pass through the
+                        # first non-None value (defensive).
+                        for _, v in per_bundle_extra_args:
+                            if k_key in v:
+                                merged_extra_args.setdefault(
+                                    k_key, v[k_key])
+                                break
 
                 logger.info(
                     "[PD] _get_or_build_merged_attn_ctx: "

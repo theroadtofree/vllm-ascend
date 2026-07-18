@@ -781,7 +781,7 @@ class SharedModelEdgeWorker(NPUWorker):
         # constructor does not depend on the model object.
         if self.use_v2_model_runner:
             logger.info("v2 is not supported for SharedModelEdgeWorker")
-        self.model_runner = BatchedModelRunner(self.vllm_config, self.device)
+        self.model_runner = BatchedModelRunner(self.vllm_config, self.device, self.local_rank)
         
         if self._is_leader:
             # Initialize edge-cloud tensor metadata for optimized communication
