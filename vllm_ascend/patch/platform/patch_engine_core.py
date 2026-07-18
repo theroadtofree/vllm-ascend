@@ -718,16 +718,25 @@ def _patched_execute_dummy_batch(self):
     dummy-middle (see worker._execute_model_cloud `is_pd_dummy` branch) and
     keeps the cloud-side cross-DP all_reduce paired.
 
+    Publish the zmq dummy for EVERY edge dummy - including wave-fill dummies
+    that fire while this DP has unfinished requests (``has_unfinished=True``)
+    but no real work this wave step. Without this, the real DP's edge skips
+    the zmq publish for its wave-fill dummies while the idle DP's edge
+    publishes for all of its dummies -> the idle cloud receives N more
+    dummies than the real cloud processes -> N dummies backlog on the idle
+    cloud -> the next request on the idle DP hangs (real PRE_OUT stuck
+    behind the backlog, PP isend init timeout). Publishing here makes cloud
+    dummy publication symmetric so both clouds process the same count.
+
     When PD-separation is off (no ``_pp_pd_channel``) this is identical to
     upstream: just ``executor.execute_dummy_batch()``.
     """
     ch = getattr(self, "_pp_pd_channel", None)
-    # Only publish dummy zmq if dp>1 AND this DP is truly idle (no unfinished
-    # requests). For dp=1, no peer DP exists, no cross-DP all_gather to pair.
-    # Publishing dummy zmq in dp=1 corrupts the cloud's PassiveScheduler.
-    _has_unfinished = self.scheduler.has_unfinished_requests()
+    # Publish dummy zmq whenever dp>1: covers both idle dummies AND wave-fill
+    # dummies during a request (has_unfinished=True). For dp=1 there is no
+    # peer DP and publishing corrupts the cloud's PassiveScheduler, so skip.
     _dp_gt1 = getattr(self.vllm_config.parallel_config, 'data_parallel_size', 1) > 1
-    if ch is not None and not _has_unfinished and _dp_gt1:
+    if ch is not None and _dp_gt1:
         from vllm.v1.core.sched.output import (
             BatchType as _BatchType,
             HiddenChannelType as _HiddenChannelType,
