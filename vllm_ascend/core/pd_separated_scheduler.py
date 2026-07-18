@@ -155,6 +155,16 @@ class PDSeparatedScheduler(Scheduler):
         self._layer_slice_config_mtime: float = 0.0
         self._load_layer_slice_config()
 
+        # [PD-phase P1] DP phase lock (Option B): when set via env
+        # VLLM_PD_PHASE, the scheduler only produces real batches of this
+        # batch_type and emits a phase-aligned dummy SchedulerOutput
+        # (total_num_scheduled_tokens == 0) when it has no phase-type work.
+        # The dummy flows through execute_model -> worker
+        # _execute_model_edge_head/_tail dummy detection -> _dummy_run,
+        # whose executed segment follows the peer via _peer_batch_type_id.
+        # None = phase lock disabled (current behavior, _phase_allows=True).
+        self._dp_phase: BatchType | None = self._load_dp_phase()
+
     def schedule(self) -> SchedulerOutput:
         return self._schedule_pd_separated()
 
@@ -163,6 +173,60 @@ class PDSeparatedScheduler(Scheduler):
         scheduler_output.finished_req_ids = self.finished_req_ids
         self.finished_req_ids = set()
         return scheduler_output
+
+    # ------------------------------------------------------------------ #
+    # PD-phase P1 (Option B): phase lock + phase-aligned dummy SO         #
+    # ------------------------------------------------------------------ #
+    def _load_dp_phase(self) -> BatchType | None:
+        raw = os.environ.get("VLLM_PD_PHASE", "").strip().lower()
+        if not raw:
+            return None
+        mapping = {
+            "prefill_first": BatchType.PREFILL_FIRST,
+            "prefill_last": BatchType.PREFILL_LAST,
+            "decode_first": BatchType.DECODE_FIRST,
+            "decode_last": BatchType.DECODE_LAST,
+        }
+        bt = mapping.get(raw)
+        if bt is None:
+            logger.warning(
+                "[PD-phase] Unknown VLLM_PD_PHASE=%r; phase lock disabled. "
+                "Expected one of %s", raw, list(mapping),
+            )
+        else:
+            logger.info("[PD-phase] phase lock enabled: _dp_phase=%s", bt.value)
+        return bt
+
+    def _phase_allows(self, batch_type: BatchType) -> bool:
+        return self._dp_phase is None or batch_type == self._dp_phase
+
+    def _make_phase_dummy(self, batch_type: BatchType) -> SchedulerOutput:
+        """Construct a phase-aligned dummy SchedulerOutput
+        (total_num_scheduled_tokens == 0). It flows through execute_model ->
+        worker _execute_model_edge_head/_tail dummy detection -> _dummy_run;
+        the dummy's actually-executed segment follows the peer via
+        _peer_batch_type_id (set by _sync_metadata_across_dp), so this SO's
+        batch_type only needs to drive edge/cloud routing + hidden channel.
+        Restricted to FIRST types for now (LAST-phase dummies interleave
+        with the step's _publish_pd_dummy_zmq path and are deferred to P2)."""
+        so = SchedulerOutput.make_empty()
+        so.batch_type = batch_type
+        so.head_token = uuid4().hex
+        if batch_type in (BatchType.PREFILL_FIRST, BatchType.PREFILL_LAST):
+            so.hidden_channel = HiddenChannelType.PREFILL_1
+        else:
+            so.hidden_channel = HiddenChannelType.DECODE
+        so.finished_req_ids = self.finished_req_ids
+        self.finished_req_ids = set()
+        return so
+
+    def _make_phase_aware_empty(self) -> SchedulerOutput:
+        # Only FIRST phases emit a dummy SO (flows through edge head dummy
+        # detection + peer-follow). LAST phases fall back to a real empty
+        # batch; LAST-phase dummy handling is deferred to P2.
+        if self._dp_phase in (BatchType.PREFILL_FIRST, BatchType.DECODE_FIRST):
+            return self._make_phase_dummy(self._dp_phase)
+        return self._make_empty_batch()
 
     def _schedule_pd_separated(self) -> SchedulerOutput:
         state = self._prefill_state()
@@ -179,9 +243,18 @@ class PDSeparatedScheduler(Scheduler):
     def _pick_by_state(self, state: PrefillState) -> SchedulerOutput:
         # D尾必须无条件优先于 D首，防止 decode_inflight_count 在 D首
         # 完成后立即释放导致 D尾 starvation。
+        # [PD-phase P1] when _dp_phase is set, each branch is additionally
+        # gated by _phase_allows(batch_type): non-phase types are skipped
+        # *without* calling _pick_*_batch (so no channel allocation /
+        # inflight-count / ready-queue-pop side effects), and the fall-through
+        # emits a phase-aligned dummy SO (FIRST phases) instead of an empty
+        # batch, so the cross-DP MoE all_reduce stays paired when this DP has
+        # no phase-type work. When _dp_phase is None, _phase_allows is always
+        # True and behavior is identical to upstream.
         if state == PrefillState.IDLE:
             # IDLE: P首/chunk0首 > D尾 > D首 > Empty.
-            if self._can_schedule_prefill_first():
+            if (self._can_schedule_prefill_first()
+                    and self._phase_allows(BatchType.PREFILL_FIRST)):
                 so = self._pick_prefill_first_batch()
                 if so.total_num_scheduled_tokens > 0:
                     return so
@@ -194,15 +267,18 @@ class PDSeparatedScheduler(Scheduler):
                     "requests. Prefill work will be deferred until resources are freed."
                 )
                 self.finished_req_ids.update(so.finished_req_ids)
-            if self.decodes_last_ready and self._can_schedule_decode_last():
+            if (self.decodes_last_ready and self._can_schedule_decode_last()
+                    and self._phase_allows(BatchType.DECODE_LAST)):
                 return self._pick_decode_last_batch()
-            if self._can_schedule_decode_first():
+            if (self._can_schedule_decode_first()
+                    and self._phase_allows(BatchType.DECODE_FIRST)):
                 return self._pick_decode_first_batch()
-            return self._make_empty_batch()
+            return self._make_phase_aware_empty()
 
         if state == PrefillState.LOW:
             # LOW: chunk/P首(when slot available) > D尾 > D首 > P尾 > Empty.
-            if self._can_schedule_prefill_first():
+            if (self._can_schedule_prefill_first()
+                    and self._phase_allows(BatchType.PREFILL_FIRST)):
                 so = self._pick_prefill_first_batch()
                 if so.total_num_scheduled_tokens > 0:
                     return so
@@ -212,22 +288,28 @@ class PDSeparatedScheduler(Scheduler):
                     "requests. Prefill work will be deferred until resources are freed."
                 )
                 self.finished_req_ids.update(so.finished_req_ids)
-            if self.decodes_last_ready and self._can_schedule_decode_last():
+            if (self.decodes_last_ready and self._can_schedule_decode_last()
+                    and self._phase_allows(BatchType.DECODE_LAST)):
                 return self._pick_decode_last_batch()
-            if self._can_schedule_decode_first():
+            if (self._can_schedule_decode_first()
+                    and self._phase_allows(BatchType.DECODE_FIRST)):
                 return self._pick_decode_first_batch()
-            if self.prefills_last_ready:
+            if (self.prefills_last_ready
+                    and self._phase_allows(BatchType.PREFILL_LAST)):
                 return self._pick_prefill_last_batch()
-            return self._make_empty_batch()
+            return self._make_phase_aware_empty()
 
         # HIGH: D尾 > D首 > P尾 > Empty. New P首 is forbidden.
-        if self.decodes_last_ready and self._can_schedule_decode_last():
+        if (self.decodes_last_ready and self._can_schedule_decode_last()
+                and self._phase_allows(BatchType.DECODE_LAST)):
             return self._pick_decode_last_batch()
-        if self._can_schedule_decode_first():
+        if (self._can_schedule_decode_first()
+                and self._phase_allows(BatchType.DECODE_FIRST)):
             return self._pick_decode_first_batch()
-        if self.prefills_last_ready:
+        if (self.prefills_last_ready
+                and self._phase_allows(BatchType.PREFILL_LAST)):
             return self._pick_prefill_last_batch()
-        return self._make_empty_batch()
+        return self._make_phase_aware_empty()
 
     def is_waiting_for_remote_tail(self) -> bool:
         """True when local requests exist only as remote in-flight work.

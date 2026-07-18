@@ -614,6 +614,29 @@ class NPUWorker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         """Edge head segment (PF/DF): segment_a -> isend -> suspend -> return EMPTY."""
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
+        # [PD-phase P0] dummy head segment (total_num_scheduled_tokens == 0):
+        # a scheduler-produced, phase-aligned dummy that keeps the cross-DP
+        # MoE all_reduce paired when this DP has no real head work. Run a
+        # dummy forward for segment_a and skip the cloud isend -- the cloud
+        # detects the dummy via total_num_scheduled_tokens==0 (see
+        # _execute_model_cloud) and runs a dummy-middle without expecting a
+        # real recv. Mirrors the cloud dummy branch. Inert until P1 drives
+        # the scheduler to emit dummy head batches.
+        if scheduler_output.total_num_scheduled_tokens == 0:
+            logger.info(
+                "[PD-PHASE] edge head DUMMY: bt=%s dp_rank=%s",
+                scheduler_output.batch_type,
+                getattr(self.model_runner, "dp_rank", "?"),
+            )
+            self.model_runner._dummy_run(
+                num_tokens=self.model_runner.decode_token_per_req,
+                uniform_decode=False,
+            )
+            # Placeholder (no sampled tokens; sampling is in the tail segment).
+            # Must be non-None: the step's batch_queue path raises
+            # RuntimeError on a None model_output. Empty req_ids since the
+            # dummy schedules no requests.
+            return ModelRunnerOutput(req_ids=[], req_id_to_index={})
         output = self.model_runner.execute_model(
             scheduler_output, intermediate_tensors=None,
             layer_slice_info=layer_slice_info,
@@ -671,6 +694,25 @@ class NPUWorker(WorkerBase):
         edge_merge = get_edge_cloud_tensor_meta().merge_payload
         """Edge tail segment (PL/DL): recv -> segment_e -> return output."""
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
+        # [PD-phase P0] dummy tail segment: the cloud published a dummy tail
+        # (correlated with this DP's earlier dummy head) so this DP runs a
+        # dummy segment_e to keep the cross-DP MoE all_reduce paired with the
+        # real DP's real tail. Skip the cloud recv -- the dummy-middle sent
+        # no real hidden states. Inert until P1 produces dummy heads that
+        # trigger cloud dummy-tail publication.
+        if scheduler_output.total_num_scheduled_tokens == 0:
+            logger.info(
+                "[PD-PHASE] edge tail DUMMY: bt=%s dp_rank=%s",
+                scheduler_output.batch_type,
+                getattr(self.model_runner, "dp_rank", "?"),
+            )
+            self.model_runner._dummy_run(
+                num_tokens=self.model_runner.decode_token_per_req,
+                uniform_decode=False,
+            )
+            # Placeholder (no sampled tokens). Must be non-None: the step's
+            # batch_queue path raises RuntimeError on a None model_output.
+            return ModelRunnerOutput(req_ids=[], req_id_to_index={})
         channel = self._hidden_channel_for(scheduler_output)
         _hang_tail_rank = getattr(self.model_runner, "dp_rank", "?")
         logger.error("[HANG] edge tail recv ENTER: dp_rank=%s channel=%s batch_type=%s",
