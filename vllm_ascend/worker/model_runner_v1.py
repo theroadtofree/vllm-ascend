@@ -5590,49 +5590,28 @@ class NPUModelRunner(GPUModelRunner):
                 if hasattr(self.drafter, "model") and hasattr(self.drafter.model, "compute_logits"):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
-            # PD-separation: DUMMY matches real DP's segment.
-            # - peer_bt == 0 (both DUMMY / idle): skip both segments for BOTH
-            #   edge and cloud. No real data to all_gather, so no MoE forward
-            #   and no cross-DP EP all-toall; only sync_metadata (already done)
-            #   keeps the all_reduce pairing. This makes DUMMY instant.
-            #   CRITICAL for cloud: without this, a cloud DUMMY always runs the
-            #   full MoE forward (all-toall on the cross-DP EP group), so two
-            #   idle clouds - each fed by its edge's self-fired dummies - end up
-            #   with mismatched all-toall counts and deadlock (the dp=2
-            #   PP-init-timeout symptom: cloud rank1 stuck in a dummy's
-            #   all-toall, never reaching the real PREFILL_FIRST).
-            # - Edge DUMMY with a real peer: run the matching segment only -
-            #   peer head (PF/DF, bt 1/3) -> run head (segment_a); peer tail
-            #   (PL/DL, bt 2/4) -> run tail (segment_e). Ensures 1:1
-            #   all_gather pairing (1 per DUMMY, 1 per real).
-            # - Cloud DUMMY with a real peer: do NOT skip - run the full middle
-            #   forward so its all-toall sequence pairs 1:1 with the real
-            #   cloud's middle segment.
+            # PD-separation: DUMMY matches real DP's segment (head or tail).
+            # If peer runs head (PF/DF), DUMMY runs head only (segment_a).
+            # If peer runs tail (PL/DL), DUMMY runs tail only (segment_e).
+            # This ensures 1:1 all_gather pairing (1 per DUMMY, 1 per real).
             hidden_states = None
             _skip_head = False
             _skip_tail = False
-            if not is_profile and not is_graph_capturing:
+            if is_edge_device() and not is_profile and not is_graph_capturing:
                 _peer_bt = self._peer_batch_type_id
-                if _peer_bt == 0:  # both DUMMY (idle or waiting)
+                if _peer_bt in (2, 4):  # peer is tail (PL/DL)
+                    _skip_head = True
+                elif _peer_bt in (1, 3):  # peer is head (PF/DF)
+                    _skip_tail = True
+                elif _peer_bt == 0:  # both DUMMY (idle or waiting)
                     # Skip both segments: no real data to all_gather.
                     # Only sync_metadata (already done) keeps the all_reduce
                     # pairing. This makes DUMMY instant (no MoE forward).
                     _skip_head = True
                     _skip_tail = True
-                elif is_edge_device():
-                    if _peer_bt in (2, 4):  # peer is tail (PL/DL)
-                        _skip_head = True
-                    elif _peer_bt in (1, 3):  # peer is head (PF/DF)
-                        _skip_tail = True
-                    # else: unmatched id - leave both False (run full forward)
-                # else (cloud, peer real): no skip - full middle forward pairs
-                # all-toall with the real cloud's middle.
                 logger.error(
-                    "[DPDBG] _dummy_run: dp_rank=%s role=%s peer_bt=%s "
-                    "skip_head=%s skip_tail=%s",
-                    self.dp_rank,
-                    "edge" if is_edge_device() else "cloud",
-                    _peer_bt, _skip_head, _skip_tail,
+                    "[DBG] _dummy_run: dp_rank=%s peer_bt=%s skip_head=%s skip_tail=%s",
+                    self.dp_rank, _peer_bt, _skip_head, _skip_tail,
                 )
 
             if not _skip_head:
