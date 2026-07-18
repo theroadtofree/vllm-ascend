@@ -3909,6 +3909,16 @@ class NPUModelRunner(GPUModelRunner):
         **model_kwargs: dict[str, Any],
     ):
         """模型前向入口。标准路径与边云路径完全分离，职责单一。"""
+        # [DPDBG] per-model-forward counter (covers both dummy and real, head
+        # and tail - any _model_forward call). Compare rank1 (dp0 cloud) vs
+        # rank6 (dp1 cloud) count sequences to locate cross-DP divergence.
+        try:
+            _f_rank = dist.get_rank() if dist.is_initialized() else -1
+        except Exception:
+            _f_rank = -1
+        _fwd_c = getattr(self, "_dpdbg_fwd_count", 0) + 1
+        self._dpdbg_fwd_count = _fwd_c
+        logger.error("[DPDBG] model_fwd: rank=%s count=%s", _f_rank, _fwd_c)
         if self._edge_cloud_enabled:
             return self._edge_cloud_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors,
