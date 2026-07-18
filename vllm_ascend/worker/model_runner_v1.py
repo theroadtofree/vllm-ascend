@@ -4151,6 +4151,22 @@ class NPUModelRunner(GPUModelRunner):
             self._cloud_prepare_cache = None
             return
 
+        # PD-separation: set _dp_batch_type_id BEFORE _run_input_preparation
+        # (which calls _determine_batch_execution_and_padding -> sync_metadata
+        # all_reduce), so the cloud real forward reports its real batch_type
+        # (1=PF/2=PL/3=DF/4=DL) to the peer. Without this, sync_metadata runs
+        # before execute_model sets _dp_batch_type_id (line ~2416), so it uses
+        # a stale value (0 from the last DUMMY) -> the peer cloud sees
+        # peer_bt=0, treats this as DUMMY and skips the all-toall, while this
+        # cloud runs the real all-toall -> cross-DP all-toall mismatch ->
+        # deadlock. (Mirror of execute_model's _bt_map at line ~2411.)
+        _bt_map = {
+            BatchType.EMPTY: 0, BatchType.PREFILL_FIRST: 1,
+            BatchType.PREFILL_LAST: 2, BatchType.DECODE_FIRST: 3,
+            BatchType.DECODE_LAST: 4,
+        }
+        self._dp_batch_type_id = _bt_map.get(scheduler_output.batch_type, 0)
+
         # Replicate scheduler_output handling from execute_model
         if (
             self.speculative_config is not None
