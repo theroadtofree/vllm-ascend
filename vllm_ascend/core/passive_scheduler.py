@@ -318,7 +318,7 @@ class PassiveScheduler:
                 now = time.monotonic()
                 if self._last_decode_first_arrival_ts is not None:
                     interval_ms = (now - self._last_decode_first_arrival_ts) * 1000
-                    logger.info(
+                    logger.debug(
                         "DECODE_FIRST arrival interval: %.2f ms",
                         interval_ms,
                     )
@@ -568,7 +568,7 @@ class PassiveScheduler:
             )
             self._clear_prefill_middle_throttle()
             return True
-        logger.info(
+        logger.debug(
             f"[PD-PASSIVE] Throttle active: {elapsed_ms:.1f}ms / {limit_ms:.0f}ms, "
             f"still waiting for decode",
         )
