@@ -582,6 +582,13 @@ class NPUWorker(WorkerBase):
                 return self._execute_model_cloud(
                     scheduler_output, layer_slice_info
                 )
+            # PD-separation dummy (cross-DP coordination): tokens==0 means
+            # this edge runs a dummy of the winner bt to pair the [0,5] EP
+            # all-toall. _dummy_run matches the peer's real segment via
+            # _peer_batch_type_id (head bt -> segment_a, tail bt -> segment_e).
+            # No isend/recv - the dummy carries no real hidden states.
+            if scheduler_output.total_num_scheduled_tokens == 0:
+                return self._execute_model_edge_dummy(scheduler_output)
             if bt in (BatchType.PREFILL_FIRST, BatchType.DECODE_FIRST):
                 return self._execute_model_edge_head(
                     scheduler_output, layer_slice_info
@@ -661,6 +668,26 @@ class NPUWorker(WorkerBase):
             req_ids=req_ids,
             req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
         )
+
+    def _execute_model_edge_dummy(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        """Edge dummy segment (cross-DP coordination, tokens==0).
+
+        Runs ``_dummy_run`` so this edge participates in the cross-DP [0,5]
+        EP all-toall pairing. ``_dummy_run`` matches the peer's real segment
+        via ``_peer_batch_type_id`` (peer head bt -> segment_a, peer tail bt
+        -> segment_e), so the dummy's all-toall pairs 1:1 with the real DP's
+        edge forward on the same layer. No isend/recv - the dummy carries no
+        real hidden states (cloud dummy-middle is driven separately by the
+        head-segment dummy zmq publish).
+        """
+        self.model_runner._dummy_run(
+            num_tokens=self.model_runner.decode_token_per_req,
+            uniform_decode=False,
+        )
+        return None
 
     def _execute_model_edge_tail(
         self,

@@ -372,6 +372,67 @@ def _pop_deferred_empty_batch(self) -> SchedulerOutput | None:
 # =======================================================================#
 # EngineCore.step — full replacement, mirrors upstream + dest inserts.    #
 # =======================================================================#
+# batch_type id packed into the coordination all_reduce. 0 = EMPTY/idle,
+# 1/2/3/4 = real PF/PL/DF/DL. A dummy SchedulerOutput carries the WINNER bt
+# (NOT 0): both DPs contribute the same winner id, so peer_bt != 0 and the
+# _dummy_run skip-both branch (peer_bt == 0) never fires under coordination
+# - this is what kills the old self-driven-dummy count-drift deadlock path.
+_BT_COORD_ID = {
+    BatchType.EMPTY: 0,
+    BatchType.PREFILL_FIRST: 1,
+    BatchType.PREFILL_LAST: 2,
+    BatchType.DECODE_FIRST: 3,
+    BatchType.DECODE_LAST: 4,
+}
+_BT_COORD_ID_INV = {v: k for k, v in _BT_COORD_ID.items()}
+
+
+def _is_coordinated_dp(self) -> bool:
+    """True when edge-side cross-DP batch_type coordination is active:
+    dp>1 (DPEngineCoreProc owns dp_group) + PD-separation channel + MoE."""
+    return (
+        getattr(self, "dp_group", None) is not None
+        and getattr(self, "_pp_pd_channel", None) is not None
+        and bool(getattr(self.vllm_config.model_config, "is_moe", False))
+    )
+
+
+def _coordinate_bt(self, intended_bt: BatchType) -> BatchType:
+    """All-reduce intended batch_type across DPs on the EngineCore stateless
+    dp_group and return the agreed winner.
+
+    Rule: the lowest-dp_rank DP with real (non-EMPTY) intent wins (dp0
+    priority); if all EMPTY -> EMPTY. Each DP then force-schedules the
+    winner (real if it has such work, else a dummy of the winner bt).
+
+    Runs every step (engines_running -> both DPs reach step_fn). The
+    all_reduce is blocking, so the two DPs' busy-loop iterations stay 1:1
+    -> step_counter stays equal -> has_unfinished_dp (every 32 steps, same
+    dp_group) fires on both DPs at the same iter, in the same
+    [coord, has_unfinished] order. No collective-ordering hazard, so the
+    existing dp_group can be reused (no second stateless group needed).
+    """
+    import torch
+    dp_group = getattr(self, "dp_group", None)
+    if dp_group is None:
+        return intended_bt
+    parallel_config = self.vllm_config.parallel_config
+    dp_size = parallel_config.data_parallel_size
+    dp_rank = parallel_config.data_parallel_rank
+    # Each rank fills its own index; SUM gathers every rank's value into its
+    # own column (same trick as model_runner _sync_metadata_across_dp).
+    tensor = torch.zeros(dp_size, dtype=torch.int32, device="cpu")
+    tensor[dp_rank] = _BT_COORD_ID.get(intended_bt, 0)
+    torch.distributed.all_reduce(tensor, group=dp_group)
+    winner_id = 0
+    for r in range(dp_size):
+        rid = int(tensor[r].item())
+        if rid != 0:
+            winner_id = rid
+            break
+    return _BT_COORD_ID_INV.get(winner_id, BatchType.EMPTY)
+
+
 def _patched_step(self):
     """Schedule, execute, and make output.
 
@@ -436,12 +497,32 @@ def _patched_step_with_batch_queue(self):
 
     model_executed = False
     deferred_scheduler_output = None
-    if self.scheduler.has_requests():
+    # [ascend insert] Cross-DP batch_type coordination (MoE DP>1): exchange
+    # intended batch_type every step and force-schedule the agreed winner so
+    # both DPs execute the same batch_type -> edge [0,5] and cloud EP
+    # all-toall pair on the same layer. engines_running guarantees both DPs
+    # reach here, and the blocking all_reduce keeps iterations 1:1 (see
+    # _coordinate_bt). The idle DP (no local requests) still enters the
+    # schedule branch via the winner (!= EMPTY) and produces a dummy.
+    _coordinated = self._is_coordinated_dp()
+    _coord_winner = BatchType.EMPTY
+    if _coordinated:
+        _coord_winner = self._coordinate_bt(
+            self.scheduler._intended_batch_type()
+        )
+    _should_schedule = bool(
+        (_coordinated and _coord_winner != BatchType.EMPTY)
+        or ((not _coordinated) and self.scheduler.has_requests())
+    )
+    if _should_schedule:
         # [ascend insert] Pull cloud-returned tail-segment batches into
         # the scheduler ready queues before picking the next batch.
         self._drain_pd_channel_inbox()
 
-        scheduler_output = self.scheduler.schedule()
+        if _coordinated:
+            scheduler_output = self.scheduler._schedule_target(_coord_winner)
+        else:
+            scheduler_output = self.scheduler.schedule()
         self._hang_last_bt = str(scheduler_output.batch_type)
 
         # [ascend insert] Assign head-token for edge-cloud head-segment
@@ -465,14 +546,17 @@ def _patched_step_with_batch_queue(self):
             BatchType.PREFILL_LAST, BatchType.DECODE_LAST
         ):
             # [方案③-fix Part 2] tail segment is edge-local (no real cloud
-            # zmq), but the peer DP's dummy goes to cloud. Publish a
-            # dummy-middle zmq so the paired cloud DP runs a dummy-middle and
-            # keeps the cloud-side cross-DP all_reduce pairing 1:1.
-            # ONLY for dp>1: dp=1 has no peer DP, no cross-DP all_gather
-            # to pair. Publishing dummy zmq in dp=1 corrupts the cloud's
-            # PassiveScheduler state machine (dummy DECODE_FIRST interferes
-            # with the real prefill/decode sequence).
-            if getattr(self.vllm_config.parallel_config, 'data_parallel_size', 1) > 1:
+            # zmq). In the NON-coordinated path the peer DP's dummy goes to
+            # cloud, so publish a dummy-middle zmq to keep the cloud-side
+            # cross-DP all_reduce pairing 1:1.
+            # Under cross-DP coordination BOTH DPs run the same tail bt this
+            # step, so both clouds are idle (tail is edge-only) and pair
+            # naturally - skip the dummy zmq (publishing it would only desync
+            # the cloud PassiveScheduler state machine).
+            _dp_gt1 = getattr(
+                self.vllm_config.parallel_config, 'data_parallel_size', 1
+            ) > 1
+            if _dp_gt1 and not _coordinated:
                 self._publish_pd_dummy_zmq()
 
         if scheduler_output.batch_type == BatchType.EMPTY:
@@ -795,6 +879,8 @@ def install() -> None:
     EngineCore._finish_empty_batch = _finish_empty_batch
     EngineCore._defer_empty_batch = _defer_empty_batch
     EngineCore._pop_deferred_empty_batch = _pop_deferred_empty_batch
+    EngineCore._is_coordinated_dp = _is_coordinated_dp
+    EngineCore._coordinate_bt = _coordinate_bt
     EngineCore.step = _patched_step
     EngineCore.step_with_batch_queue = _patched_step_with_batch_queue
     EngineCore.execute_dummy_batch = _patched_execute_dummy_batch
