@@ -620,6 +620,12 @@ class PassiveEngineCoreProc:
                         self._pending_post_out_by_head_token[head_token] = (
                             batch.scheduler_output
                         )
+            # [PD-phase] dummy head (total_num_scheduled_tokens == 0): do NOT
+            # publish a tail. Under Option B the edge dummy's executed segment
+            # follows the peer via _peer_batch_type_id (set by
+            # _sync_metadata_across_dp), so the edge does not consume a cloud
+            # dummy tail -- publishing one would only leak into the edge's
+            # last-ready queue. (方案③ DECODE_FIRST dummies also still skip.)
         return True
 
     def _maybe_publish_post_out(
