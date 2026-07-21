@@ -497,6 +497,16 @@ def _patched_step_with_batch_queue(self):
 
     model_executed = False
     deferred_scheduler_output = None
+    # [ascend insert] Pull cloud-returned tail-segment batches into the
+    # scheduler ready queues BEFORE coord/intent. This MUST run every step
+    # (unconditional, not gated on _should_schedule): when the edge is
+    # waiting for a cloud tail, prefills_last_ready is empty until drained,
+    # so _intended_batch_type() returns EMPTY -> winner EMPTY ->
+    # _should_schedule False. Gating the drain on _should_schedule would
+    # skip it forever -> PL/DL never drained -> prefill/decode never
+    # completes (deadlock). Draining first breaks the cycle: PL/DL enters
+    # the ready queue, intended reflects it, winner becomes non-EMPTY.
+    self._drain_pd_channel_inbox()
     # [ascend insert] Cross-DP batch_type coordination (MoE DP>1): exchange
     # intended batch_type every step and force-schedule the agreed winner so
     # both DPs execute the same batch_type -> edge [0,5] and cloud EP
@@ -515,10 +525,6 @@ def _patched_step_with_batch_queue(self):
         or ((not _coordinated) and self.scheduler.has_requests())
     )
     if _should_schedule:
-        # [ascend insert] Pull cloud-returned tail-segment batches into
-        # the scheduler ready queues before picking the next batch.
-        self._drain_pd_channel_inbox()
-
         if _coordinated:
             scheduler_output = self.scheduler._schedule_target(_coord_winner)
         else:
