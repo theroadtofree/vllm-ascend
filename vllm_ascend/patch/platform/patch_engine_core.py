@@ -397,42 +397,50 @@ def _is_coordinated_dp(self) -> bool:
     )
 
 
-def _coordinate_bt(self, intended_bt: BatchType) -> BatchType:
-    """All-reduce intended batch_type across DPs and return the agreed winner.
+def _coordinate_bt(
+    self, intended_bt: BatchType, local_unfinished: bool
+) -> tuple[BatchType, bool]:
+    """All-reduce intended batch_type AND has_unfinished across DPs in ONE
+    all_reduce on dp_group, every step. Returns (winner, engines_running).
 
-    Rule: the lowest-dp_rank DP with real (non-EMPTY) intent wins (dp0
-    priority); if all EMPTY -> EMPTY. Each DP then force-schedules the
-    winner (real if it has such work, else a dummy of the winner bt).
+    Combining the two exchanges into a single per-step all_reduce (instead of
+    a coord all_reduce every step + a has_unfinished all_reduce every 32
+    steps) eliminates the desync window: engines_running is recomputed every
+    step on both DPs from the same all_reduce, so the two DPs always agree on
+    running/idle -> they pause together. The old 32-step has_unfinished skip
+    left engines_running stale-True between all_reduces; if the two DPs'
+    step_counters diverged even briefly, one DP stayed stale-True (looping in
+    coord) while the other went False (paused) -> the looping DP blocked in
+    coord waiting for the paused DP -> hang risk under sustained load.
 
-    Uses a SEPARATE communicator (dp_coord_group) from the one used by
-    has_unfinished_dp (dp_group). This is critical: the busy-loop `continue`
-    path skips _has_global_unfinished_reqs (both the has_unfinished all_reduce
-    AND the step_counter++). If coord and has_unfinished shared dp_group, a
-    step where one DP `continue`s (skip) while the other does has_unfinished
-    would desync the per-group all_reduce call count -> coord and
-    has_unfinished mispair on the same communicator -> hang. A distinct
-    communicator makes the two all_reduce streams independent (no shared
-    ordering constraint).
+    Rule: winner = lowest-dp_rank DP with real (non-EMPTY) intent (dp0
+    priority); all EMPTY -> EMPTY. engines_running = OR(local_unfinished)
+    (sum > 0). Each DP then force-schedules the winner (real if it has such
+    work, else a dummy of the winner bt).
+
+    Reuses the EngineCore stateless dp_group (same communicator the worker
+    uses for sync_metadata). Safe because coord mode runs this single
+    all_reduce every step on both DPs (no second all_reduce stream, no
+    32-step skip, no `continue` skip - the busy loop gates `continue` on
+    `not _is_coordinated_dp()`), so the per-group call count is always paired.
     """
     import torch
-    dp_group = getattr(self, "dp_coord_group", None) or getattr(
-        self, "dp_group", None
-    )
+    dp_group = getattr(self, "dp_group", None)
     if dp_group is None:
-        return intended_bt
+        return intended_bt, bool(local_unfinished)
     parallel_config = self.vllm_config.parallel_config
     dp_size = parallel_config.data_parallel_size
     dp_rank = parallel_config.data_parallel_rank
-    # Each rank fills its own index; SUM gathers every rank's value into its
-    # own column (same trick as model_runner _sync_metadata_across_dp).
-    tensor = torch.zeros(dp_size, dtype=torch.int32, device="cpu")
+    # Layout: [bt_id_0 .. bt_id_{dp_size-1}, unfinished_local].
+    # Each rank fills its own bt_id index (others 0) so SUM gathers per-rank
+    # bt_id; every rank adds its 0/1 unfinished at the last slot so SUM there
+    # = count of running DPs (>0 => engines_running). Same SUM-gather trick
+    # as model_runner _sync_metadata_across_dp.
+    tensor = torch.zeros(dp_size + 1, dtype=torch.int32, device="cpu")
     tensor[dp_rank] = _BT_COORD_ID.get(intended_bt, 0)
+    tensor[dp_size] = 1 if local_unfinished else 0
     _cnt = getattr(self, "_coord_bt_count", 0) + 1
     self._coord_bt_count = _cnt
-    logger.error(
-        "[DPDBG][COORD] enter: dp_rank=%s count=%s intended=%s",
-        dp_rank, _cnt, _BT_COORD_ID.get(intended_bt, 0),
-    )
     torch.distributed.all_reduce(tensor, group=dp_group)
     winner_id = 0
     for r in range(dp_size):
@@ -441,11 +449,17 @@ def _coordinate_bt(self, intended_bt: BatchType) -> BatchType:
             winner_id = rid
             break
     _winner = _BT_COORD_ID_INV.get(winner_id, BatchType.EMPTY)
-    logger.error(
-        "[DPDBG][COORD] exit: dp_rank=%s count=%s winner=%s",
-        dp_rank, _cnt, _BT_COORD_ID.get(_winner, 0),
-    )
-    return _winner
+    _engines_running = int(tensor[dp_size].item()) > 0
+    # Throttle: log every 32 calls and whenever real work is coordinated.
+    if _cnt % 32 == 0 or winner_id != 0:
+        logger.error(
+            "[DPDBG][COORD] dp_rank=%s count=%s intended=%s winner=%s "
+            "engines_running=%s",
+            dp_rank, _cnt,
+            _BT_COORD_ID.get(intended_bt, 0), _BT_COORD_ID.get(_winner, 0),
+            int(_engines_running),
+        )
+    return _winner, _engines_running
 
 
 def _patched_step(self):
@@ -533,10 +547,16 @@ def _patched_step_with_batch_queue(self):
     _coord_winner = BatchType.EMPTY
     if _coordinated:
         _intended_batch_type = self.scheduler._intended_batch_type()
-        _coord_winner = self._coordinate_bt(_intended_batch_type)
-        vllm_logger.info(
-            f"Coordinated batch_type: {_coord_winner.value}, intended: {_intended_batch_type.value}"
+        # Combined coord + has_unfinished all_reduce: also exchanges
+        # local_unfinished so engines_running is recomputed every step on
+        # both DPs (see _coordinate_bt). Store the result for the busy loop's
+        # _has_global_unfinished_reqs to reuse (no separate has_unfinished
+        # all_reduce in coord mode).
+        _local_unfinished = self.scheduler.has_unfinished_requests()
+        _coord_winner, _coord_engines_running = self._coordinate_bt(
+            _intended_batch_type, _local_unfinished
         )
+        self._coord_engines_running = _coord_engines_running
     _should_schedule = bool(
         (_coordinated and _coord_winner != BatchType.EMPTY)
         or ((not _coordinated) and self.scheduler.has_requests())
