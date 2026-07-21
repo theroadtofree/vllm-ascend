@@ -4847,6 +4847,26 @@ class NPUModelRunner(GPUModelRunner):
             )
             if not layer_slice_info.is_last_slice:
                 model_kwargs["layer_slice_return_intermediate"] = True
+            # [FIX] When ForwardContext is recreated for each slice,
+            # moe_layer_index resets to 0, causing every slice to
+            # reference all_moe_layers[0] (the first MoE layer).
+            # Compute the correct starting index based on the slice's
+            # global start layer.
+            if (
+                forward_context is not None
+                and forward_context.all_moe_layers is not None
+            ):
+                from vllm.model_executor.models.utils import (
+                    extract_layer_index,
+                )
+                global_start = layer_slice_info.start_layer + self.head_k
+                moe_start = sum(
+                    1
+                    for name in forward_context.all_moe_layers
+                    if extract_layer_index(name) < global_start
+                )
+                forward_context.moe_layer_index = moe_start
+
         # [DPDBG] seg_c entry/exit log (VLLM_DPDBG_SEGC=1). Localizes whether a
         # dummy forward that entered _model_forward (skip_head=False) actually
         # reaches and returns from seg_c. If "segc EXIT" prints for bt=0 but
@@ -4868,6 +4888,7 @@ class NPUModelRunner(GPUModelRunner):
                 None if layer_slice_info is None else
                 f"{layer_slice_info.slice_index}/{layer_slice_info.total_slices}",
             )
+
         hidden_states = seg_c(
             positions=positions,
             intermediate_tensors=intermediate_tensors,
