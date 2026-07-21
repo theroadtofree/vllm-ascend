@@ -517,8 +517,10 @@ def _patched_step_with_batch_queue(self):
     _coordinated = self._is_coordinated_dp()
     _coord_winner = BatchType.EMPTY
     if _coordinated:
-        _coord_winner = self._coordinate_bt(
-            self.scheduler._intended_batch_type()
+        _intended_batch_type = self.scheduler._intended_batch_type()
+        _coord_winner = self._coordinate_bt(_intended_batch_type)
+        vllm_logger.info(
+            f"Coordinated batch_type: {_coord_winner.value}, intended: {_intended_batch_type.value}"
         )
     _should_schedule = bool(
         (_coordinated and _coord_winner != BatchType.EMPTY)
