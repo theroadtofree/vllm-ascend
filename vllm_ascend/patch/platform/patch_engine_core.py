@@ -404,20 +404,17 @@ def _coordinate_bt(self, intended_bt: BatchType) -> BatchType:
     priority); if all EMPTY -> EMPTY. Each DP then force-schedules the
     winner (real if it has such work, else a dummy of the winner bt).
 
-    Uses a SEPARATE communicator (dp_coord_group) from the one used by
-    has_unfinished_dp (dp_group). This is critical: the busy-loop `continue`
-    path skips _has_global_unfinished_reqs (both the has_unfinished all_reduce
-    AND the step_counter++). If coord and has_unfinished shared dp_group, a
-    step where one DP `continue`s (skip) while the other does has_unfinished
-    would desync the per-group all_reduce call count -> coord and
-    has_unfinished mispair on the same communicator -> hang. A distinct
-    communicator makes the two all_reduce streams independent (no shared
-    ordering constraint).
+    Reuses the EngineCore stateless ``dp_group`` (same communicator as
+    ``has_unfinished_dp``). This is safe because the busy loop gates its
+    ``continue`` (which would skip ``_has_global_unfinished_reqs``) on
+    ``not _is_coordinated_dp()``: in coord mode every step runs both coord
+    and has_unfinished, so the per-group all_reduce call count stays paired
+    across DPs (no desync). coord is 1:1 (blocking) and runs every step, so
+    iterations stay 1:1 -> step_counter stays equal -> has_unfinished's
+    32-step skip fires on both DPs at the same iter.
     """
     import torch
-    dp_group = getattr(self, "dp_coord_group", None) or getattr(
-        self, "dp_group", None
-    )
+    dp_group = getattr(self, "dp_group", None)
     if dp_group is None:
         return intended_bt
     parallel_config = self.vllm_config.parallel_config
@@ -429,10 +426,6 @@ def _coordinate_bt(self, intended_bt: BatchType) -> BatchType:
     tensor[dp_rank] = _BT_COORD_ID.get(intended_bt, 0)
     _cnt = getattr(self, "_coord_bt_count", 0) + 1
     self._coord_bt_count = _cnt
-    logger.error(
-        "[DPDBG][COORD] enter: dp_rank=%s count=%s intended=%s",
-        dp_rank, _cnt, _BT_COORD_ID.get(intended_bt, 0),
-    )
     torch.distributed.all_reduce(tensor, group=dp_group)
     winner_id = 0
     for r in range(dp_size):
@@ -441,10 +434,14 @@ def _coordinate_bt(self, intended_bt: BatchType) -> BatchType:
             winner_id = rid
             break
     _winner = _BT_COORD_ID_INV.get(winner_id, BatchType.EMPTY)
-    logger.error(
-        "[DPDBG][COORD] exit: dp_rank=%s count=%s winner=%s",
-        dp_rank, _cnt, _BT_COORD_ID.get(_winner, 0),
-    )
+    # Throttle: log every 32 calls and whenever real work is coordinated
+    # (winner != EMPTY) - enough to see pairing progress without flooding.
+    if _cnt % 32 == 0 or winner_id != 0:
+        logger.error(
+            "[DPDBG][COORD] dp_rank=%s count=%s intended=%s winner=%s",
+            dp_rank, _cnt,
+            _BT_COORD_ID.get(intended_bt, 0), _BT_COORD_ID.get(_winner, 0),
+        )
     return _winner
 
 
