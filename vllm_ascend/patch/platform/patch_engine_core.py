@@ -398,22 +398,26 @@ def _is_coordinated_dp(self) -> bool:
 
 
 def _coordinate_bt(self, intended_bt: BatchType) -> BatchType:
-    """All-reduce intended batch_type across DPs on the EngineCore stateless
-    dp_group and return the agreed winner.
+    """All-reduce intended batch_type across DPs and return the agreed winner.
 
     Rule: the lowest-dp_rank DP with real (non-EMPTY) intent wins (dp0
     priority); if all EMPTY -> EMPTY. Each DP then force-schedules the
     winner (real if it has such work, else a dummy of the winner bt).
 
-    Runs every step (engines_running -> both DPs reach step_fn). The
-    all_reduce is blocking, so the two DPs' busy-loop iterations stay 1:1
-    -> step_counter stays equal -> has_unfinished_dp (every 32 steps, same
-    dp_group) fires on both DPs at the same iter, in the same
-    [coord, has_unfinished] order. No collective-ordering hazard, so the
-    existing dp_group can be reused (no second stateless group needed).
+    Uses a SEPARATE communicator (dp_coord_group) from the one used by
+    has_unfinished_dp (dp_group). This is critical: the busy-loop `continue`
+    path skips _has_global_unfinished_reqs (both the has_unfinished all_reduce
+    AND the step_counter++). If coord and has_unfinished shared dp_group, a
+    step where one DP `continue`s (skip) while the other does has_unfinished
+    would desync the per-group all_reduce call count -> coord and
+    has_unfinished mispair on the same communicator -> hang. A distinct
+    communicator makes the two all_reduce streams independent (no shared
+    ordering constraint).
     """
     import torch
-    dp_group = getattr(self, "dp_group", None)
+    dp_group = getattr(self, "dp_coord_group", None) or getattr(
+        self, "dp_group", None
+    )
     if dp_group is None:
         return intended_bt
     parallel_config = self.vllm_config.parallel_config
@@ -423,6 +427,12 @@ def _coordinate_bt(self, intended_bt: BatchType) -> BatchType:
     # own column (same trick as model_runner _sync_metadata_across_dp).
     tensor = torch.zeros(dp_size, dtype=torch.int32, device="cpu")
     tensor[dp_rank] = _BT_COORD_ID.get(intended_bt, 0)
+    _cnt = getattr(self, "_coord_bt_count", 0) + 1
+    self._coord_bt_count = _cnt
+    logger.error(
+        "[DPDBG][COORD] enter: dp_rank=%s count=%s intended=%s",
+        dp_rank, _cnt, _BT_COORD_ID.get(intended_bt, 0),
+    )
     torch.distributed.all_reduce(tensor, group=dp_group)
     winner_id = 0
     for r in range(dp_size):
@@ -430,7 +440,12 @@ def _coordinate_bt(self, intended_bt: BatchType) -> BatchType:
         if rid != 0:
             winner_id = rid
             break
-    return _BT_COORD_ID_INV.get(winner_id, BatchType.EMPTY)
+    _winner = _BT_COORD_ID_INV.get(winner_id, BatchType.EMPTY)
+    logger.error(
+        "[DPDBG][COORD] exit: dp_rank=%s count=%s winner=%s",
+        dp_rank, _cnt, _BT_COORD_ID.get(_winner, 0),
+    )
+    return _winner
 
 
 def _patched_step(self):
