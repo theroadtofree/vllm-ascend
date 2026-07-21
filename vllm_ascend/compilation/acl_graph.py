@@ -444,7 +444,8 @@ _draft_graph_params: GraphParams | None = None
 def set_draft_graph_params(aclgraph_capture_sizes: list[int]):
     global _draft_graph_params
     if _draft_graph_params is not None:
-        raise ValueError("DraftGraph parameters have already been set!")
+        logger.info("DraftGraph parameters have already been set!")
+        return
     _draft_graph_params = GraphParams(
         {size: [] for size in aclgraph_capture_sizes},
         {size: None for size in aclgraph_capture_sizes},

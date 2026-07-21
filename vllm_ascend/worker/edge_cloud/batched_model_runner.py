@@ -31,7 +31,7 @@ from vllm.config import CUDAGraphMode
 from vllm.config.vllm import VllmConfig
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.parallel_state import get_pp_group, set_edge_cloud_layer_range
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -336,12 +336,29 @@ class BatchedModelRunner(NPUModelRunner):
                 self.drafter,
                 AscendEagleProposer | AscendDflashProposer
                 | AscendDraftModelProposer)
-            block_size = (
-                self.kernel_block_sizes[0]
-                if isinstance(self.kernel_block_sizes, list)
-                else self.kernel_block_sizes)
-            self.drafter.initialize_attn_backend(
-                self.kv_cache_config, block_size)
+            skip_edge_drafter_attn_init = (
+                self._edge_cloud_enabled
+                and self.edge_cloud_cfg.role == "edge"
+                and self.speculative_config.method in ("mtp", "eagle3")
+            )
+            if skip_edge_drafter_attn_init:
+                # All draft decoder layers run on the cloud. Their stale
+                # static-forward-context entries have already been removed on
+                # the edge, so the edge KV cache config intentionally contains
+                # no draft attention layers.
+                self.drafter.draft_attn_groups = []
+                logger.info(
+                    "[EdgeCloud] Edge skipped %s drafter attention backend "
+                    "initialization.",
+                    self.speculative_config.method,
+                )
+            else:
+                block_size = (
+                    self.kernel_block_sizes[0]
+                    if isinstance(self.kernel_block_sizes, list)
+                    else self.kernel_block_sizes
+                )
+                self.drafter.initialize_attn_backend(self.kv_cache_config, block_size)
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
@@ -509,8 +526,37 @@ class BatchedModelRunner(NPUModelRunner):
             logger.info("Loading drafter model for shared model binding...")
             if self.vllm_config.quant_config is not None:
                 patch_load_weights(self.vllm_config)
+
+            is_edge_cloud_draft_drafter = (
+                self.speculative_config is not None
+                and self.speculative_config.method in ("mtp", "eagle3")
+            )
+            if is_edge_cloud_draft_drafter:
+                # Draft models (MTP/Eagle3) use the same edge-cloud layer range
+                # mechanism as the main model. In both embedding_only and
+                # head_tail modes all draft decoder layers run on the cloud, so
+                # temporarily use head_k=tail_k=0 while loading the drafter.
+                set_edge_cloud_layer_range(0, 0)
+                if self.speculative_config.method == "eagle3":
+                    import vllm_ascend.patch.models.eagle3_edge_cloud  # noqa: F401
+            
             with get_tp_context(self.drafter):
                 self.drafter.load_model(self.model)
+
+            if (
+                is_edge_cloud_draft_drafter
+                and hasattr(self.drafter, "model")
+                and self.drafter.model is not None
+            ):
+                self._setup_edge_cloud_draft(
+                    self.drafter.model, self.speculative_config.method
+                )
+
+            if is_edge_cloud_draft_drafter:
+                # Do not leak the drafter's cloud-only range into later
+                # main-model initialization or cache setup.
+                set_edge_cloud_layer_range(self.head_k, self.tail_k)
+            
             if self.use_aux_hidden_state_outputs:
                 from vllm.model_executor.models.interfaces import supports_eagle3
                 if not supports_eagle3(self.model):
