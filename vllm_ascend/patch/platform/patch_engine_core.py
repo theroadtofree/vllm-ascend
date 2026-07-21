@@ -552,7 +552,22 @@ def _patched_step_with_batch_queue(self):
         # both DPs (see _coordinate_bt). Store the result for the busy loop's
         # _has_global_unfinished_reqs to reuse (no separate has_unfinished
         # all_reduce in coord mode).
-        _local_unfinished = self.scheduler.has_unfinished_requests()
+        #
+        # IMPORTANT: include bool(batch_queue) in the exchanged value. A
+        # batch_queue entry is an in-flight batch whose forward may be done
+        # but not yet popped (e.g. a real batch enqueued via early-return,
+        # awaiting pop). Such a leftover keeps has_work=True (so this DP
+        # steps into coord) but has_unfinished_requests()=False (request
+        # already finished). If engines_running only reflected requests, the
+        # PEER could pause (engines_running=False, no work) while THIS DP
+        # loops on the batch_queue leftover -> this DP blocks in coord
+        # waiting for the paused peer -> hang. Including batch_queue makes
+        # engines_running=True as long as either DP has an unpopped batch, so
+        # both DPs keep looping until the leftover is popped.
+        _local_unfinished = (
+            self.scheduler.has_unfinished_requests()
+            or bool(self.batch_queue)
+        )
         _coord_winner, _coord_engines_running = self._coordinate_bt(
             _intended_batch_type, _local_unfinished
         )
