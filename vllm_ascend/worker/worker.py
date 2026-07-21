@@ -682,12 +682,19 @@ class NPUWorker(WorkerBase):
         edge forward on the same layer. No isend/recv - the dummy carries no
         real hidden states (cloud dummy-middle is driven separately by the
         head-segment dummy zmq publish).
+
+        Returns an empty ModelRunnerOutput placeholder (NOT None): the edge
+        step_with_batch_queue treats ``future.result() is None`` as an
+        execute_model failure (raises RuntimeError "unexpected error"), so
+        the dummy must return a non-None placeholder. The scheduler's
+        update_from_output short-circuits on is_pd_dummy, so the placeholder
+        is never consumed.
         """
         self.model_runner._dummy_run(
             num_tokens=self.model_runner.decode_token_per_req,
             uniform_decode=False,
         )
-        return None
+        return ModelRunnerOutput(req_ids=[], req_id_to_index={})
 
     def _execute_model_edge_tail(
         self,

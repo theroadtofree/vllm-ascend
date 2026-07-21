@@ -730,6 +730,13 @@ class PDSeparatedScheduler(Scheduler):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, Any]:
+        # Cross-DP coordination dummy: no real requests scheduled, no inflight
+        # count changes, no channel ops. Skip all bt-specific bookkeeping
+        # (else PL/DF branches would wrongly decrement inflight counters that
+        # the dummy never incremented). The worker already ran _dummy_run for
+        # the a2a pairing; there is nothing to update here.
+        if getattr(scheduler_output, "is_pd_dummy", False):
+            return {}
         if scheduler_output.batch_type == BatchType.PREFILL_LAST:
             if self.prefill_inflight_count > 0:
                 self.prefill_inflight_count -= 1
