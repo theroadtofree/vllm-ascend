@@ -1060,9 +1060,14 @@ def edge_cloud_irecv_tensor_dict(
                 recv_view, src=pp_group.ranks[src], group=group
             )
         recv_view.record_stream(_pps)
-        # compute stream waits for pp_stream: the received data must land
-        # before the model forward (segment_e/segment_c) reads it.
-        torch.npu.current_stream().wait_stream(_pps)
+        # NO compute.wait_stream(pp_stream): the irecv handle is waited
+        # CPU-side by AsyncIntermediateTensors.wait_for_comm() (lazy,
+        # triggered when .tensors is accessed) BEFORE the model forward
+        # reads the data. Putting a GPU wait_stream here would make the
+        # compute stream's tolist (aclrtSynchronizeStream, full stream
+        # sync) wait for the irecv, re-creating the cross-batch pipeline
+        # cycle (edge tail gdn -> irecv -> cloud isend -> cloud a2a ->
+        # cloud gdn -> cloud irecv -> edge isend -> edge a2a -> prev batch).
         # Zero-fill the SP padding tail (see the non-merge path for why).
         # The merged buffer is TP-broadcast and split into per-key tensors,
         # so the tail padding flows into every per-key tensor; it must be
@@ -1142,7 +1147,10 @@ def edge_cloud_irecv_tensor_dict(
         else:
             tensor_dict[key] = value
 
-    torch.npu.current_stream().wait_stream(_pps)
+    # NO compute.wait_stream(_pps): handles are waited CPU-side by
+    # AsyncIntermediateTensors.wait_for_comm() before the forward reads
+    # data. A GPU wait_stream here would make tolist (full stream sync)
+    # wait for the irecv, re-creating the pipeline cycle.
     return tensor_dict, handles, postprocess
 
 
