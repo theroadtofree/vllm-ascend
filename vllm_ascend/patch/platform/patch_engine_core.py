@@ -547,33 +547,52 @@ def _patched_step_with_batch_queue(self):
     _coord_winner = BatchType.EMPTY
     if _coordinated:
         _intended_batch_type = self.scheduler._intended_batch_type()
-        # Combined coord + has_unfinished all_reduce: also exchanges
-        # local_unfinished so engines_running is recomputed every step on
+        # Combined coord + has_unfinished all_reduce: also exchanges a
+        # "has work" flag so engines_running is recomputed every step on
         # both DPs (see _coordinate_bt). Store the result for the busy loop's
         # _has_global_unfinished_reqs to reuse (no separate has_unfinished
         # all_reduce in coord mode).
         #
-        # IMPORTANT: include bool(batch_queue) in the exchanged value. A
-        # batch_queue entry is an in-flight batch whose forward may be done
-        # but not yet popped (e.g. a real batch enqueued via early-return,
-        # awaiting pop). Such a leftover keeps has_work=True (so this DP
-        # steps into coord) but has_unfinished_requests()=False (request
-        # already finished). If engines_running only reflected requests, the
-        # PEER could pause (engines_running=False, no work) while THIS DP
-        # loops on the batch_queue leftover -> this DP blocks in coord
-        # waiting for the paused peer -> hang. Including batch_queue makes
-        # engines_running=True as long as either DP has an unpopped batch, so
-        # both DPs keep looping until the leftover is popped.
-        _local_unfinished = (
-            self.scheduler.has_unfinished_requests()
-            or bool(self.batch_queue)
-        )
+        # IMPORTANT: use has_requests() (NOT has_unfinished_requests()).
+        # has_requests() = has_unfinished_requests() OR has_finished_requests()
+        # - it includes finished-but-not-yet-returned requests that still need
+        # a step to be cleaned up. Combined with bool(batch_queue) (in-flight
+        # batches whose forward may be done but not popped), this covers all
+        # reasons a DP must keep stepping. If engines_running only reflected
+        # has_unfinished_requests, a DP with a finished-not-returned request
+        # (has_work=True via has_requests) would loop into coord while the
+        # peer (no work) paused -> coord blocks waiting for the paused peer
+        # -> hang. Exchanging has_requests()|batch_queue keeps both DPs
+        # running until ALL work (including finished-request cleanup and
+        # batch_queue drain) is done on both sides.
+        _has_req = self.scheduler.has_requests()
+        _has_bq = bool(self.batch_queue)
+        _local_has_work = _has_req or _has_bq
         _coord_winner, _coord_engines_running = self._coordinate_bt(
-            _intended_batch_type, _local_unfinished
+            _intended_batch_type, _local_has_work
         )
         self._coord_engines_running = _coord_engines_running
+        _cnt = getattr(self, "_coord_bt_count", 0)
+        if _local_has_work or _cnt % 32 == 0:
+            logger.error(
+                "[DPDBG][COORD-IN] dp_rank=%s has_requests=%s has_unfinished=%s "
+                "batch_queue=%s local_has_work=%s winner=%s engines_running=%s",
+                self.vllm_config.parallel_config.data_parallel_rank,
+                int(_has_req),
+                int(self.scheduler.has_unfinished_requests()),
+                int(_has_bq), int(_local_has_work),
+                _BT_COORD_ID.get(_coord_winner, 0), int(_coord_engines_running),
+            )
+    # In coord mode, also schedule when has_requests() even if winner=EMPTY:
+    # a finished-but-not-yet-returned request (has_requests=True,
+    # has_unfinished=False) needs an empty batch to carry its
+    # finished_req_ids through update_from_output so it gets cleaned up.
+    # Without this, winner=EMPTY skips scheduling -> finished_req_ids never
+    # returned -> has_requests stays True forever -> this DP loops in coord
+    # forever (and blocks the peer). _schedule_target(EMPTY) returns
+    # _make_empty_batch() which carries finished_req_ids.
     _should_schedule = bool(
-        (_coordinated and _coord_winner != BatchType.EMPTY)
+        (_coordinated and (_coord_winner != BatchType.EMPTY or _has_req))
         or ((not _coordinated) and self.scheduler.has_requests())
     )
     if _should_schedule:
