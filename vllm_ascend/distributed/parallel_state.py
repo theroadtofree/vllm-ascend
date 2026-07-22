@@ -731,6 +731,33 @@ def _get_edge_cloud_hidden_channel_device_group(
     return pp_group.device_group
 
 
+# ----------------------------------------------------------------------- #
+# Dedicated NPU stream for edge-cloud PP isend/irecv                      #
+# ----------------------------------------------------------------------- #
+# PP P2P comm (isend/irecv) runs on this stream instead of the default
+# compute stream. Without separation, a pending isend/irecv on the compute
+# stream blocks the stream's sync points (tolist/.item in gdn attention):
+# the tolist sync waits for the isend, which waits for the remote irecv,
+# which waits for the remote a2a, which waits for the remote compute ...
+# Under batch_queue pipelining this forms a cross-batch circular dependency
+# -> hang. With a dedicated stream, the compute stream's tolist only waits
+# for compute ops (gdn/a2a), not for isend/irecv, breaking the cycle.
+#
+# Data dependencies are handled with stream waits:
+#   isend: pp_stream.wait_stream(compute) before isend (data must be ready)
+#   irecv: compute.wait_stream(pp_stream) after irecv (data must be received)
+_pp_comm_stream: Any = None
+
+
+def _get_pp_comm_stream() -> Any:
+    """Lazy-init the dedicated PP communication stream."""
+    global _pp_comm_stream
+    if _pp_comm_stream is None:
+        import torch_npu
+        _pp_comm_stream = torch_npu.npu.Stream()
+    return _pp_comm_stream
+
+
 def edge_cloud_isend_tensor_dict(
     tensor_dict: dict[str, torch.Tensor | Any],
     dst: int | None = None,
@@ -862,14 +889,21 @@ def edge_cloud_isend_tensor_dict(
             "was initialized with inconsistent per-tensor shapes; re-init "
             "it or unset VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD."
         )
-        handle = torch.distributed.isend(
-            merged, dst=pp_group.ranks[dst], group=group
-        )
-        if merged.is_cuda:
-            merged.record_stream(torch.cuda.current_stream(merged.device))
+        _pps = _get_pp_comm_stream()
+        # pp_stream waits for compute stream: the merged buffer is produced
+        # by the model forward (compute stream); isend must not read it
+        # before the forward completes.
+        _pps.wait_stream(torch.npu.current_stream())
+        with torch.npu.stream(_pps):
+            handle = torch.distributed.isend(
+                merged, dst=pp_group.ranks[dst], group=group
+            )
+        merged.record_stream(_pps)
         handles.append(handle)
         return handles
 
+    _pps = _get_pp_comm_stream()
+    _pps.wait_stream(torch.npu.current_stream())
     for key in send_keys:
         value = tensor_dict[key]
         if not isinstance(value, torch.Tensor):
@@ -888,13 +922,11 @@ def edge_cloud_isend_tensor_dict(
             # only happens when upstream code returned a non-standard
             # layout, in which case we materialize once.
             value = value.contiguous()
-        handle = torch.distributed.isend(
-            value, dst=pp_group.ranks[dst], group=group
-        )
-        if value.is_cuda:
-            value.record_stream(torch.cuda.current_stream(value.device))
-        elif value.device.type == "npu":
-            value.record_stream(torch.npu.current_stream(value.device))
+        with torch.npu.stream(_pps):
+            handle = torch.distributed.isend(
+                value, dst=pp_group.ranks[dst], group=group
+            )
+        value.record_stream(_pps)
         handles.append(handle)
 
     return handles
@@ -1022,9 +1054,15 @@ def edge_cloud_irecv_tensor_dict(
         # the leading num_tokens rows (mirrors the non-merge SP path).  When
         # SP is off this view is the whole buffer, a no-op.
         recv_view = merged[:num_tokens]
-        handle = torch.distributed.irecv(
-            recv_view, src=pp_group.ranks[src], group=group
-        )
+        _pps = _get_pp_comm_stream()
+        with torch.npu.stream(_pps):
+            handle = torch.distributed.irecv(
+                recv_view, src=pp_group.ranks[src], group=group
+            )
+        recv_view.record_stream(_pps)
+        # compute stream waits for pp_stream: the received data must land
+        # before the model forward (segment_e/segment_c) reads it.
+        torch.npu.current_stream().wait_stream(_pps)
         # Zero-fill the SP padding tail (see the non-merge path for why).
         # The merged buffer is TP-broadcast and split into per-key tensors,
         # so the tail padding flows into every per-key tensor; it must be
@@ -1059,6 +1097,7 @@ def edge_cloud_irecv_tensor_dict(
     recv_num_tokens = _pad_num_tokens_to_tp_multiple(num_tokens)
     send_keys = set(ec_meta.send_tensor_keys or ec_meta.tensor_keys)
 
+    _pps = _get_pp_comm_stream()
     for key, value in ec_meta.metadata_list:
         if isinstance(value, TensorMetadata):
             # Replace the placeholder dim-0 with the TP-padded size; the
@@ -1074,9 +1113,11 @@ def edge_cloud_irecv_tensor_dict(
 
             if key in send_keys:
                 recv_view = full_tensor[:num_tokens]
-                handle = torch.distributed.irecv(
-                    recv_view, src=pp_group.ranks[src], group=group
-                )
+                with torch.npu.stream(_pps):
+                    handle = torch.distributed.irecv(
+                        recv_view, src=pp_group.ranks[src], group=group
+                    )
+                recv_view.record_stream(_pps)
                 handles.append(handle)
                 # Zero-fill the SP padding tail.  The sender only transmits
                 # the real num_tokens rows; the remaining
@@ -1101,6 +1142,7 @@ def edge_cloud_irecv_tensor_dict(
         else:
             tensor_dict[key] = value
 
+    torch.npu.current_stream().wait_stream(_pps)
     return tensor_dict, handles, postprocess
 
 
