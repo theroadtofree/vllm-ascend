@@ -659,7 +659,14 @@ class NPUWorker(WorkerBase):
                                             num_tokens=scheduler_output.total_num_scheduled_tokens),
                 channel=channel,
             )
-            logger.info(f"Send intermediate tensors to cloud, hidden_channel: {channel.value}")
+            logger.error(
+                "[PP-EVT] SEND dp_rank=%s bt=%s ht=%s ch=%s tokens=%s",
+                self.model_runner.dp_rank,
+                scheduler_output.batch_type.value,
+                getattr(scheduler_output, "head_token", "?"),
+                channel.value,
+                scheduler_output.total_num_scheduled_tokens,
+            )
         # Return a placeholder output that carries the request IDs so the
         # scheduler can correlate the batch, but contains no sampled tokens
         # because sampling happens in the tail segment (PL/DL).
@@ -719,6 +726,12 @@ class NPUWorker(WorkerBase):
         logger.error("[HANG] edge tail recv EXIT: dp_rank=%s channel=%s",
                     _hang_tail_rank, channel.value)
         _hang_sys.stderr.flush()
+        logger.error(
+            "[PP-EVT] RECV dp_rank=%s bt=%s ht=%s ch=%s tokens=%s",
+            _hang_tail_rank, scheduler_output.batch_type.value,
+            getattr(scheduler_output, "head_token", "?"),
+            channel.value, scheduler_output.total_num_scheduled_tokens,
+        )
         logger.info(f"Receive intermediate tensors from cloud after, hidden_channel: {channel.value}")
 
         if edge_sp and not edge_merge:
@@ -840,6 +853,12 @@ class NPUWorker(WorkerBase):
                 _hang_cld_rank, channel.value,
             )
             _hang_sys.stderr.flush()
+            logger.error(
+                "[PP-EVT] CLOUD-RECV dp_rank=%s bt=%s ht=%s ch=%s tokens=%s",
+                _hang_cld_rank, scheduler_output.batch_type.value,
+                getattr(scheduler_output, "head_token", "?"),
+                channel.value, scheduler_output.total_num_scheduled_tokens,
+            )
 
             self.model_runner.cloud_prepare_early(scheduler_output)
             if do_sp_chunk and not merge_payload:
@@ -908,6 +927,12 @@ class NPUWorker(WorkerBase):
             logger.error("[HANG] cloud return isend EXIT: dp_rank=%s channel=%s",
                         _hang_ret_rank, channel.value)
             _hang_sys.stderr.flush()
+            logger.error(
+                "[PP-EVT] CLOUD-SEND dp_rank=%s bt=%s ht=%s ch=%s tokens=%s",
+                _hang_ret_rank, scheduler_output.batch_type.value,
+                getattr(scheduler_output, "head_token", "?"),
+                channel.value, scheduler_output.total_num_scheduled_tokens,
+            )
             logger.info(f"Send intermediate tensors to edge, hidden_channel={channel.value}")
         return output
 
