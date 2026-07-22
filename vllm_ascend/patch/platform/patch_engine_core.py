@@ -441,6 +441,7 @@ def _coordinate_bt(
     tensor[dp_size] = 1 if local_unfinished else 0
     _cnt = getattr(self, "_coord_bt_count", 0) + 1
     self._coord_bt_count = _cnt
+    self.step_cnt = 0
     torch.distributed.all_reduce(tensor, group=dp_group)
     winner_id = 0
     for r in range(dp_size):
@@ -547,6 +548,7 @@ def _patched_step_with_batch_queue(self):
     _coord_winner = BatchType.EMPTY
     if _coordinated:
         _intended_batch_type = self.scheduler._intended_batch_type()
+        self.step_cnt += 1
         # Combined coord + has_unfinished all_reduce: also exchanges a
         # "has work" flag so engines_running is recomputed every step on
         # both DPs (see _coordinate_bt). Store the result for the busy loop's
@@ -571,10 +573,11 @@ def _patched_step_with_batch_queue(self):
         _coord_winner, _coord_engines_running = self._coordinate_bt(
             _intended_batch_type, _local_has_work
         )
+        vllm_logger.error(f"step_cnt={self.step_cnt} _coord_winner={_coord_winner} _intended_batch_type={_intended_batch_type}")
         self._coord_engines_running = _coord_engines_running
         _cnt = getattr(self, "_coord_bt_count", 0)
         if _local_has_work or _cnt % 32 == 0:
-            logger.error(
+            vllm_logger.error(
                 "[DPDBG][COORD-IN] dp_rank=%s has_requests=%s has_unfinished=%s "
                 "batch_queue=%s local_has_work=%s winner=%s engines_running=%s",
                 self.vllm_config.parallel_config.data_parallel_rank,
@@ -683,7 +686,8 @@ def _patched_step_with_batch_queue(self):
                     for _, so, _ in batch_queue
                 ]
                 vllm_logger.info(
-                    "[BATCH_QUEUE] Enqueued %s, queue_len=%d, types=%s",
+                    "[BATCH_QUEUE] step_cnt=%d Enqueued %s, queue_len=%d, types=%s",
+                    self.step_cnt,
                     scheduler_output.batch_type.value,
                     len(batch_queue),
                     queue_types,
