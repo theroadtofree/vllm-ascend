@@ -499,6 +499,7 @@ class PassiveEngineCoreProc:
         scheduler_input,
         dispatch_policy=None,
         pp_pd_channel: Optional["PPSchedulerZmqChannel"] = None,
+        dp_coord_group=None,  # stateless ProcessGroup for cloud cross-DP coordination
     ) -> None:
         passive_scheduler_module = _import_passive_scheduler_module()
         if dispatch_policy is None:
@@ -510,11 +511,18 @@ class PassiveEngineCoreProc:
         # scheduler_input is any object exposing consume_new_outputs(); in
         # PD-separation mode this is the cloud-side PPSchedulerZmqChannel.
         self.passive_scheduler = passive_scheduler_module.PassiveScheduler(
-            vllm_config, scheduler_input, dispatch_policy=dispatch_policy
+            vllm_config, scheduler_input,
+            dispatch_policy=dispatch_policy,
+            dp_coord_group=dp_coord_group,
         )
         # Optional POST_OUT (cloud → edge) channel. Only set on the cloud
         # side in PD-separation mode; left None for the legacy PP path.
         self._pp_pd_channel = pp_pd_channel
+        # Stateless ProcessGroup for cloud-side cross-DP batch_type
+        # coordination (dp>1 + MoE + PD-separation). When set, the step()
+        # loop coordinates with the peer cloud DP before dispatching to
+        # keep the cloud-side EP all-toall 1:1 paired.
+        self.dp_coord_group = dp_coord_group
         if getattr(vllm_config.parallel_config, "enable_edge_cloud", False):
             # PassiveEngineCore runs in a freshly-spawned subprocess; the
             # ``_ASCEND_CONFIG`` singleton may be empty here. ``init_ascend_config``
@@ -582,67 +590,58 @@ class PassiveEngineCoreProc:
         Batches are dispatched one phase at a time in the order encoded by
         the configured dispatch policy.
 
+        Cross-DP coordination (when dp>1 + MoE + PD-separation) is handled
+        internally by :meth:`PassiveScheduler.schedule` via
+        :meth:`~PassiveScheduler._coordinate_decision`.
+
         Returns:
             True if at least one payload was enqueued, False if the
             scheduler had nothing to dispatch.
         """
         self._drain_worker_completion_acks()
         self.passive_scheduler.poll_and_classify()
+
         batch = self.passive_scheduler.schedule()
+
         if batch.is_empty():
             return False
 
-        _disp_so = batch.scheduler_output
-        if _disp_so.total_num_scheduled_tokens == 0:
-            logger.error(
-                "[HANG] cloud step dispatch dummy: dp_rank=%s head_token=%s",
-                getattr(self.vllm_config.parallel_config, "data_parallel_rank", "?"),
-                getattr(_disp_so, "head_token", "?"),
-            )
+        # 打印 batch.slices
+        logger.info("batch.slices: %s", batch.slices)
 
-        _slice_info_str = "["
-        for s in batch.slices:
-            if s is not None:
-                _slice_info_str += (
-                    f"slice_index={s.slice_index},"
-                    f"start={s.start_layer},"
-                    f"end={s.end_layer},"
-                    f"is_last={s.is_last_slice};"
-                )
-            else:
-                _slice_info_str += "None;"
-        _slice_info_str += "]"
-        logger.info(
-            f"\r\n[Cloud] Step dispatched batch_type: "
-            f"{batch.scheduler_output.batch_type}, "
-            f"slices_count={len(batch.slices)}, "
-            f"slice_info={_slice_info_str}",
-        )
 
         for slice_info in batch.slices:
             worker_scheduler_output = _trim_scheduler_output_for_worker_enqueue(
                 batch.scheduler_output,
                 self._prev_dispatch_req_ids,
             )
+
+            # [SLICE-DIAG] Log cloud enqueue with slice info.
+            _tokens = batch.scheduler_output.total_num_scheduled_tokens
+            _si = slice_info
+            logger.error(
+                "[SLICE-DIAG] cloud step enqueue: tokens=%s slices=%s "
+                "slice_info=%s is_first=%s is_last=%s start=%s end=%s total=%s",
+                _tokens,
+                len(batch.slices),
+                type(_si).__name__ if _si is not None else "None",
+                getattr(_si, "is_first_slice", None) if _si is not None else None,
+                getattr(_si, "is_last_slice", None) if _si is not None else None,
+                getattr(_si, "start_layer", None) if _si is not None else None,
+                getattr(_si, "end_layer", None) if _si is not None else None,
+                getattr(_si, "total_slices", None) if _si is not None else None,
+            )
+
             payload = (
                 (worker_scheduler_output, slice_info)
                 if slice_info is not None
                 else (worker_scheduler_output,)
             )
-            bt = batch.scheduler_output.batch_type.value
-            logger.info("[CLOUD-MQ] About to enqueue batch_type=%s", bt)
-            _t0 = time.monotonic()
             self.executor.rpc_broadcast_mq.enqueue(
                 (b"pp_scheduler_output", payload, {}, None)
             )
             self._prev_dispatch_req_ids = set(
                 batch.scheduler_output.num_scheduled_tokens.keys()
-            )
-            _dt_ms = (time.monotonic() - _t0) * 1000
-            logger.info(
-                "[CLOUD-ENQUEUE] %s enqueue took %.3f ms",
-                bt,
-                _dt_ms,
             )
             # For PREFILL_FIRST, POST_OUT must mean the cloud middle segment
             # has completed and started sending hidden states back.  Store the
@@ -850,10 +849,55 @@ class PassiveEngineCoreProc:
 
             if scheduler_input is not None:
                 executor.start_worker_monitor(inline=False)
+
+                # --- Cross-DP coordination group (cloud side) ---
+                # When dp>1 + MoE + PD-separation, create a stateless
+                # ProcessGroup so both cloud DPs can coordinate before
+                # dispatching (exchange intended bt → agree on winner →
+                # force-schedule).  This keeps the cloud-side EP
+                # all-toall paired on the same layer.
+                # Uses a dedicated port (master_port + 200) to avoid
+                # conflicting with the edge's dp_group (master_port).
+                dp_coord_group = None
+                _dp_size = getattr(
+                    vllm_config.parallel_config, "data_parallel_size", 1
+                )
+                _is_moe = bool(getattr(
+                    vllm_config.model_config, "is_moe", False
+                ))
+                if _dp_size > 1 and _pd_enabled and _is_moe:
+                    from vllm.distributed.utils import (
+                        stateless_init_torch_distributed_process_group,
+                    )
+                    _coord_port = (
+                        vllm_config.parallel_config.master_port + 200
+                    )
+                    # Both cloud PassiveEngineCore processes are colocated
+                    # on the same cloud machine — use localhost for the
+                    # TCP rendezvous.  master_addr / data_parallel_master_ip
+                    # points to the edge machine, which has no gloo server
+                    # on this port.
+                    dp_coord_group = (
+                        stateless_init_torch_distributed_process_group(
+                            host="127.0.0.1",
+                            port=_coord_port,
+                            rank=_dp_rank,
+                            world_size=_dp_size,
+                            backend="gloo",
+                        )
+                    )
+                    logger.info(
+                        "Cloud cross-DP coord group created: "
+                        "dp_rank=%s/%s port=%s",
+                        _dp_rank, _dp_size, _coord_port,
+                    )
+                # -------------------------------------------------------
+
                 proc = PassiveEngineCoreProc(
                     vllm_config, executor, scheduler_input,
                     dispatch_policy=policy,
                     pp_pd_channel=pp_pd_channel,
+                    dp_coord_group=dp_coord_group,
                 )
                 proc.run_busy_loop()
             else:

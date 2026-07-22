@@ -30,10 +30,10 @@ decode_last_delay_schedule_ms: 30
 # Default: 10 (ms).
 prefill_middle_throttle_ms: 500
 
-16: 1
-8: 1
-4: 1
-3: 1
-2: 1
-1: 1
-0: 1
+16: 20
+8: 20
+4: 12
+3: 12
+2: 12
+1: 12
+0: 12

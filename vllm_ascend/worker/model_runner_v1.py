@@ -4601,6 +4601,16 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_across_dp = self._layerwise_num_tokens_across_dp
         batch_desc = self._layerwise_batch_desc
 
+        # Non-first slices must participate in the cross-DP all_reduce
+        # so that the peer DP's _dummy_run (which always calls
+        # _sync_metadata_across_dp) does not deadlock.  The returned
+        # values are discarded — continuation uses the slice-0 cached
+        # results above, which are already correct.
+        self._sync_metadata_across_dp(
+            num_tokens=num_tokens_padded,
+            cudagraph_mode=CUDAGraphMode.NONE,
+        )
+
         has_encoder_input = False
         clear_kv_metadata = self.speculative_config is None
 
@@ -5483,9 +5493,26 @@ class NPUModelRunner(GPUModelRunner):
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         profile_cpp: bool = False,
+        layer_slice_info: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
+
+        # [SLICE-DIAG] Log whether _dummy_run receives layer_slice_info.
+        _lsi = layer_slice_info
+        logger.error(
+            "[SLICE-DIAG] _dummy_run: layer_slice_info=%s "
+            "is_first=%s is_last=%s start=%s end=%s total=%s "
+            "num_tokens=%s uniform_decode=%s",
+            type(_lsi).__name__ if _lsi is not None else "None",
+            getattr(_lsi, "is_first_slice", None) if _lsi is not None else None,
+            getattr(_lsi, "is_last_slice", None) if _lsi is not None else None,
+            getattr(_lsi, "start_layer", None) if _lsi is not None else None,
+            getattr(_lsi, "end_layer", None) if _lsi is not None else None,
+            getattr(_lsi, "total_slices", None) if _lsi is not None else None,
+            num_tokens,
+            uniform_decode,
+        )
         # If cudagraph_mode.decode_mode() == FULL and
         # cudagraph_mode.separate_routine(). This means that we are using
         # different graphs and/or modes for mixed prefill-decode batches vs.
@@ -5684,29 +5711,56 @@ class NPUModelRunner(GPUModelRunner):
                     # Edge 端：不需要中间张量（第一阶段）
                     intermediate_tensors = None
                 else:
-                    # Cloud 端：需要中间张量
-                    intermediate_tokens = num_tokens_padded
-                    # embedding-only 模式下 Cloud 从首层开始执行，输入来自 Edge 的
-                    # embedding 输出，应为完整序列长度（运行时
-                    # sync_and_slice_intermediate_tensors 亦使用完整 num_tokens）。
-                    if enable_sp() and (self.edge_cloud_cfg.mode != "embedding_only"
-                        or not self.supports_mm_inputs):
-                        tp_size = get_tensor_model_parallel_world_size()
-                        intermediate_tokens = (num_tokens_padded + tp_size - 1) // tp_size
-                    if self.intermediate_tensors is None:
-                        # 首次创建 intermediate_tensors，使用最大可能 token 数
-                        max_actual_tokens = self.max_num_tokens
+                    # Cloud 端：需要中间张量。
+                    # Layer-sliced dummy: non-first slices reuse the
+                    # intermediate state saved by the previous slice,
+                    # just like _execute_layerwise_continuation.
+                    if (
+                        layer_slice_info is not None
+                        and not layer_slice_info.is_first_slice
+                        and self._layerwise_intermediate is not None
+                    ):
+                        intermediate_tensors = self._layerwise_intermediate
+                        self._layerwise_intermediate = None
+                    else:
+                        intermediate_tokens = num_tokens_padded
+                        # embedding-only 模式下 Cloud 从首层开始执行，输入来自 Edge 的
+                        # embedding 输出，应为完整序列长度（运行时
+                        # sync_and_slice_intermediate_tensors 亦使用完整 num_tokens）。
                         if enable_sp() and (self.edge_cloud_cfg.mode != "embedding_only"
                             or not self.supports_mm_inputs):
-                            max_actual_tokens = (self.max_num_tokens + tp_size - 1) // tp_size
-                        # 调用模型方法创建空的中间张量
-                        self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
-                            batch_size=max_actual_tokens, dtype=self.dtype, device=self.device
+                            tp_size = get_tensor_model_parallel_world_size()
+                            intermediate_tokens = (num_tokens_padded + tp_size - 1) // tp_size
+                        if self.intermediate_tensors is None:
+                            # 首次创建 intermediate_tensors，使用最大可能 token 数
+                            max_actual_tokens = self.max_num_tokens
+                            if enable_sp() and (self.edge_cloud_cfg.mode != "embedding_only"
+                                or not self.supports_mm_inputs):
+                                max_actual_tokens = (self.max_num_tokens + tp_size - 1) // tp_size
+                            # 调用模型方法创建空的中间张量
+                            self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
+                                batch_size=max_actual_tokens, dtype=self.dtype, device=self.device
+                            )
+                            logger.info(
+                                "[Cloud _dummy_run] Created intermediate_tensors "
+                                "hidden_states shape=%s via make_empty_intermediate_tensors",
+                                list(self.intermediate_tensors["hidden_states"].shape),
+                            )
+                        # 切片到实际需要的 token 数
+                        intermediate_tensors = IntermediateTensors(
+                            {k: v[:intermediate_tokens] for k, v in self.intermediate_tensors.items()}
                         )
-                        logger.info(
-                            "[Cloud _dummy_run] Created intermediate_tensors "
-                            "hidden_states shape=%s via make_empty_intermediate_tensors",
-                            list(self.intermediate_tensors["hidden_states"].shape),
+                        # Zero-fill to avoid NaN from uninitialized memory
+                        # (make_empty_intermediate_tensors may use torch.empty)
+                        for _k, _v in intermediate_tensors.items():
+                            _v.zero_()
+                        _diag_hs = intermediate_tensors["hidden_states"]
+                        logger.error(
+                            "[PD-DIAG] D. cloud _dummy_run INPUT (intermediate_tensors): "
+                            "shape=%s norm=%.6f mean=%.6f",
+                            list(_diag_hs.shape),
+                            float(_diag_hs.float().norm().item()),
+                            float(_diag_hs.float().mean().item()),
                         )
                     # 切片到实际需要的 token 数
                     intermediate_tensors = IntermediateTensors(
@@ -5811,8 +5865,22 @@ class NPUModelRunner(GPUModelRunner):
                     has_sinks = self._has_sinks,
                     input_ids=input_ids,
                 ):
+                    # Build model kwargs for layer-sliced dummy execution.
+                    _model_kwargs: dict[str, Any] = {}
+                    if layer_slice_info is not None and self._edge_cloud_enabled:
+                        _model_kwargs["layer_slice_start"] = (
+                            layer_slice_info.start_layer + self.head_k
+                        )
+                        _model_kwargs["layer_slice_end"] = (
+                            layer_slice_info.end_layer + self.head_k
+                        )
+                        if not layer_slice_info.is_last_slice:
+                            _model_kwargs["layer_slice_return_intermediate"] = True
                     outputs = self._model_forward(
-                        num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
+                        num_tokens_padded, input_ids, positions,
+                        intermediate_tensors, inputs_embeds,
+                        layer_slice_info=layer_slice_info,
+                        **_model_kwargs,
                     )
                 if self.use_aux_hidden_state_outputs:
                     hidden_states, _ = outputs
@@ -5820,6 +5888,21 @@ class NPUModelRunner(GPUModelRunner):
                     hidden_states = outputs["hidden_states"]
                 else:
                     hidden_states = outputs
+                # Layer-sliced dummy: save intermediate state for the
+                # next slice (mirrors execute_model's layerwise state
+                # saving for real prefill).
+                if (
+                    layer_slice_info is not None
+                    and not layer_slice_info.is_last_slice
+                    and isinstance(outputs, IntermediateTensors)
+                ):
+                    self._layerwise_intermediate = outputs
+                    # Also save positions / attn_metadata for continuation.
+                    self._layerwise_positions = positions
+                    self._layerwise_attn_metadata = attn_metadata
+                    self._layerwise_num_tokens_padded = num_tokens_padded
+                    self._layerwise_num_tokens_across_dp = num_tokens_across_dp
+                    self._layerwise_batch_desc = batch_desc
                 # PD-separation diagnostic: log _dummy_run segment_a output
                 if not is_profile and not is_graph_capturing:
                     _has_nan = bool(torch.isnan(hidden_states).any().item()) if hasattr(hidden_states, 'shape') and hidden_states.dim() > 0 else '?'
