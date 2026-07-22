@@ -126,6 +126,7 @@ def _patched_engine_core_init(self, *args, **kwargs):
     from vllm_ascend.pd_separation_config import PDSeparationConfig
     pd_config = PDSeparationConfig.from_env()
 
+    self.step_cnt = 0
     # Edge-cloud PD-separation bidirectional ZMQ channel (edge side).
     self._pp_pd_channel = None
     if pd_enabled and getattr(parallel_config, "is_edge_node", False):
@@ -441,7 +442,6 @@ def _coordinate_bt(
     tensor[dp_size] = 1 if local_unfinished else 0
     _cnt = getattr(self, "_coord_bt_count", 0) + 1
     self._coord_bt_count = _cnt
-    self.step_cnt = 0
     torch.distributed.all_reduce(tensor, group=dp_group)
     winner_id = 0
     for r in range(dp_size):
