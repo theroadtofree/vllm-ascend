@@ -1321,7 +1321,7 @@ class NPUModelRunner(GPUModelRunner):
         except Exception:
             _sm_rank = -1
         logger.error(
-            "[DPDBG] sync_meta: rank=%s dp_rank=%s call=%s my_bt=%s peer_bt=%s "
+            "[PP-EVT][DPDBG] sync_meta: rank=%s dp_rank=%s call=%s my_bt=%s peer_bt=%s "
             "num_tokens=%s",
             _sm_rank, self.dp_rank, _smc, self._dp_batch_type_id,
             self._peer_batch_type_id, num_tokens,

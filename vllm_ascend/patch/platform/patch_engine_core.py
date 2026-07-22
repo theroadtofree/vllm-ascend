@@ -686,7 +686,7 @@ def _patched_step_with_batch_queue(self):
                     for _, so, _ in batch_queue
                 ]
                 vllm_logger.info(
-                    "[BATCH_QUEUE] step_cnt=%d Enqueued %s, queue_len=%d, types=%s",
+                    "[PP-EVT][BATCH_QUEUE] step_cnt=%d Enqueued %s, queue_len=%d, types=%s",
                     self.step_cnt,
                     scheduler_output.batch_type.value,
                     len(batch_queue),
