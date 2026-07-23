@@ -3937,6 +3937,12 @@ class NPUModelRunner(GPUModelRunner):
         _fwd_c = getattr(self, "_dpdbg_fwd_count", 0) + 1
         self._dpdbg_fwd_count = _fwd_c
         logger.error("[DPDBG] model_fwd: rank=%s count=%s", _f_rank, _fwd_c)
+        # [DPDBG] expose batch_type to MoE prepare/finalize for moe_evt logging.
+        try:
+            from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+            _EXTRA_CTX.dp_batch_type_id = self._dp_batch_type_id
+        except Exception:
+            pass
         if self._edge_cloud_enabled:
             return self._edge_cloud_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors,

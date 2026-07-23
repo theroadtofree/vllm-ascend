@@ -346,6 +346,7 @@ class _ExtraForwardContextProxy:
         "in_profile_run",
         "padded_num_tokens",
         "sinks",
+        "dp_batch_type_id",
     )
 
     def check_extra_attr(self, name: str):
