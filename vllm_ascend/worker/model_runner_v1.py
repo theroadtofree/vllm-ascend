@@ -5776,6 +5776,15 @@ class NPUModelRunner(GPUModelRunner):
                     hidden_states = outputs["hidden_states"]
                 else:
                     hidden_states = outputs
+                # PD-separation diagnostic: log _dummy_run segment_ee output
+                if not is_profile and not is_graph_capturing:
+                    _has_nan = bool(torch.isnan(hidden_states).any().item()) if hasattr(hidden_states, 'shape') and hidden_states.dim() > 0 else '?'
+                    logger.error(
+                        "[PD-DIAG] E. _dummy_run segment_e OUTPUT: "
+                        "shape=%s has_nan=%s",
+                        list(hidden_states.shape) if hasattr(hidden_states, 'shape') else '?',
+                        _has_nan,
+                    )
                 dummy_compute_logits(hidden_states)
 
                 if is_profile and self.dynamic_eplb:
