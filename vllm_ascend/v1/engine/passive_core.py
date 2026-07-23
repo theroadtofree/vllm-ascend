@@ -601,6 +601,9 @@ class PassiveEngineCoreProc:
         self._drain_worker_completion_acks()
         self.passive_scheduler.poll_and_classify()
 
+        if not self.passive_scheduler.sync_queue_state():
+            return False
+
         batch = self.passive_scheduler.schedule()
 
         if batch.is_empty():

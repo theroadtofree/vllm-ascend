@@ -694,6 +694,61 @@ class PassiveScheduler:
     # EXPECT_ALTERNATION: decision / coordination / application           #
     # ------------------------------------------------------------------ #
 
+    def sync_queue_state(self) -> bool:
+        """Sync queue lengths across cloud DPs via all_reduce.
+
+        Checks that ready_prefills, ready_decodes, ready_pdmixes,
+        _active_prefill_slices, and _active_sliced_prefill have consistent
+        lengths/non-None status across all DPs.  If any queue is out of
+        sync, the method returns False so the caller can sleep and retry.
+
+        When dp_coord_group is not set or coordination is disabled,
+        returns True immediately (no sync needed).
+        """
+        if self.dp_coord_group is None or not self._is_coordinated_dp():
+            return True
+
+        import torch
+        import torch.distributed as dist
+        _dp_size = getattr(
+            self.vllm_config.parallel_config, "data_parallel_size", 1
+        )
+        _dp_rank = getattr(
+            self.vllm_config.parallel_config, "data_parallel_rank", 0
+        )
+
+        # 5 fields: ready_prefills, ready_decodes, ready_pdmixes,
+        #           _active_prefill_slices, has _active_sliced_prefill
+        local = [
+            len(self.ready_prefills),
+            len(self.ready_decodes),
+            len(self.ready_pdmixes),
+            len(self._active_prefill_slices),
+            1 if self._active_sliced_prefill is not None else 0,
+        ]
+
+        # Each rank writes to its own row; SUM leaves values independent.
+        tensor = torch.zeros(_dp_size * 5, dtype=torch.int32, device="cpu")
+        base = _dp_rank * 5
+        for i, v in enumerate(local):
+            tensor[base + i] = v
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM,
+                         group=self.dp_coord_group)
+
+        # Verify all rank values are identical for each of the 5 queues.
+        all_match = True
+        for q in range(5):
+            vals = [int(tensor[r * 5 + q].item()) for r in range(_dp_size)]
+            if len(set(vals)) != 1:
+                _names = ["ready_prefills", "ready_decodes", "ready_pdmixes",
+                          "_active_prefill_slices", "_active_sliced_prefill"]
+                logger.warning(
+                    "[SYNC-QUEUE] rank=%s %s mismatch: %s",
+                    _dp_rank, _names[q], vals,
+                )
+                all_match = False
+        return all_match
+
     def _schedule_expect_alternation(self) -> ScheduledBatch:
         """Pick the next batch to dispatch under the EEP/EED state machine.
 
@@ -701,6 +756,8 @@ class PassiveScheduler:
         three-phase flow is used: decide → coordinate → apply.  Otherwise
         the original single-DP logic is used.
         """
+        if self.dp_coord_group is not None and self._is_coordinated_dp():
+            return self._schedule_expect_alternation_coordinated()
         return self._schedule_expect_alternation_simple()
 
     def _is_coordinated_dp(self) -> bool:
