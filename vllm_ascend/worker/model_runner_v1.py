@@ -2621,6 +2621,12 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens=total_num_scheduled_tokens,
                 cudagraph_mode=cudagraph_mode,
             )
+            logger.error(
+                "[DPDBG] tail_sync_meta: cached_tnst=%s so_tnst=%s ntad=%s",
+                total_num_scheduled_tokens,
+                scheduler_output.total_num_scheduled_tokens,
+                num_tokens_across_dp,
+            )
         elif _cloud_fast_path:
             cache = self._cloud_prepare_cache
             self._cloud_prepare_cache = None  # consumed, clear for next iteration
@@ -2884,6 +2890,10 @@ class NPUModelRunner(GPUModelRunner):
                 "cudagraph_stats": cudagraph_stats,
                 "total_num_scheduled_tokens": total_num_scheduled_tokens,
             }
+            logger.error(
+                "[DPDBG] head_cache: tnst=%s ntad=%s ntp=%s",
+                total_num_scheduled_tokens, num_tokens_across_dp, num_tokens_padded,
+            )
 
         # Encoder-decoder models can only compile the pure decode steps where no
         # encoder inputs are present. Use eager for the first pass.
