@@ -2618,12 +2618,12 @@ class NPUModelRunner(GPUModelRunner):
             # all_reduce pairing 1:1; the result is ignored (the tail uses the
             # cached values above for the forward).
             self._sync_metadata_across_dp(
-                num_tokens=total_num_scheduled_tokens,
+                num_tokens=num_tokens_padded,
                 cudagraph_mode=cudagraph_mode,
             )
             logger.error(
-                "[DPDBG] tail_sync_meta: cached_tnst=%s so_tnst=%s ntad=%s",
-                total_num_scheduled_tokens,
+                "[DPDBG] tail_sync_meta: cached_ntp=%s so_tnst=%s ntad=%s",
+                num_tokens_padded,
                 scheduler_output.total_num_scheduled_tokens,
                 num_tokens_across_dp,
             )
