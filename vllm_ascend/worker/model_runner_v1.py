@@ -2618,7 +2618,7 @@ class NPUModelRunner(GPUModelRunner):
             # all_reduce pairing 1:1; the result is ignored (the tail uses the
             # cached values above for the forward).
             self._sync_metadata_across_dp(
-                num_tokens=scheduler_output.total_num_scheduled_tokens,
+                num_tokens=total_num_scheduled_tokens,
                 cudagraph_mode=cudagraph_mode,
             )
         elif _cloud_fast_path:
