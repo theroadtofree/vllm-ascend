@@ -556,6 +556,8 @@ class PassiveScheduler:
         self._prefill_middle_throttle_started_at = None
 
     def _can_fallback_to_prefill_in_decode_state(self) -> bool:
+        return True
+        '''
         started_at = self._prefill_middle_throttle_started_at
         if started_at is None:
             return True
@@ -573,6 +575,7 @@ class PassiveScheduler:
             f"still waiting for decode",
         )
         return False
+        '''
 
     def schedule(self) -> ScheduledBatch:
         """Pick the next SchedulerOutput to dispatch.
