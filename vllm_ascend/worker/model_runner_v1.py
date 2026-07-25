@@ -3954,25 +3954,10 @@ class NPUModelRunner(GPUModelRunner):
         except Exception:
             pass
         if self._edge_cloud_enabled:
-            _result = self._edge_cloud_forward(
+            return self._edge_cloud_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors,
                 inputs_embeds, **model_kwargs,
             )
-            # [PD-FIX] Sync compute stream (transitively waits for HCCL ops
-            # on DP/EP group streams via event dependencies) after each
-            # forward, BEFORE the next forward's HCCL ops are queued. This
-            # prevents cross-forward HCCL op interleaving on the DP and EP
-            # HCCL streams, which under pipeline depth>1 can form a cross-
-            # stream circular wait (DP-stream all_gather <-> EP-stream a2a)
-            # that deadlocks. Cost: loses cross-forward overlap, but within-
-            # forward compute-HCCL overlap is preserved. Dummy path's .item()
-            # already does this sync; this adds it for the REAL path.
-            try:
-                if not torch.compiler.is_compiling():
-                    torch.npu.current_stream().synchronize()
-            except Exception:
-                pass
-            return _result
 
         # ==================== 标准非边云路径（原逻辑完全保留，不做任何修改） ====================
         assert self.model is not None
