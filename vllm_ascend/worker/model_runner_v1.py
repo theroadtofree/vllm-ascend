@@ -5712,6 +5712,26 @@ class NPUModelRunner(GPUModelRunner):
                     hidden_states = outputs
                 # PD-separation diagnostic: log _dummy_run segment_a output
                 if not is_profile and not is_graph_capturing:
+                    # [DPDBG] pre-item diagnostic: which forward's .item() is
+                    # about to run, and is the compute stream idle? If stream
+                    # is idle but .item() hangs -> .item() waits on another
+                    # stream (HCCL). If stream not idle -> a prior op blocks.
+                    try:
+                        _pre_evt = torch.npu.Event()
+                        _pre_evt.record()
+                        _pre_done = _pre_evt.query()
+                        logger.error(
+                            "[DPDBG] pre_item: rank=%s fwd=%s stream_idle=%s",
+                            dist.get_rank() if dist.is_initialized() else -1,
+                            getattr(self, '_dpdbg_fwd_count', -1),
+                            int(_pre_done),
+                        )
+                    except Exception:
+                        logger.error(
+                            "[DPDBG] pre_item: rank=%s fwd=%s stream_idle Exception",
+                            dist.get_rank() if dist.is_initialized() else -1,
+                            getattr(self, '_dpdbg_fwd_count', -1)
+                        )
                     _has_nan = bool(torch.isnan(hidden_states).any().item()) if hasattr(hidden_states, 'shape') and hidden_states.dim() > 0 else '?'
                     logger.error(
                         "[PD-DIAG] E. _dummy_run segment_a OUTPUT: "
