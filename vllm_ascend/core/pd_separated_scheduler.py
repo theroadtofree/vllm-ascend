@@ -657,7 +657,7 @@ class PDSeparatedScheduler(Scheduler):
             if scheduler_output is not None:
                 if scheduler_output.total_num_scheduled_tokens == 0:
                     scheduler_output.batch_type = BatchType.EMPTY
-                    logger.error(
+                    logger.debug(
                         "DECODE_FIRST returned empty batch (total_num_scheduled_tokens=0) "
                         "despite %d running requests. This indicates a severe KV cache "
                         "shortage or scheduler budget exhaustion.",
