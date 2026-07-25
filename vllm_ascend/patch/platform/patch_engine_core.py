@@ -218,10 +218,11 @@ def _maybe_publish_pre_out(
     if getattr(self, "_pp_pd_channel", None) is None:
         return
     bt = scheduler_output.batch_type
-    if bt in (BatchType.DECODE_FIRST, BatchType.PREFILL_FIRST):
+    if bt == BatchType.DECODE_FIRST:
         self._pp_pd_channel.publish(scheduler_output)
     elif bt in (
         BatchType.EMPTY,
+        BatchType.PREFILL_FIRST,
         BatchType.PREFILL_LAST,
         BatchType.DECODE_LAST,
     ):
@@ -619,20 +620,10 @@ def _patched_step_with_batch_queue(self):
         ):
             scheduler_output.head_token = uuid4().hex
 
-        # [ascend insert] DECODE_FIRST and PREFILL_FIRST are published
-        # immediately so the cloud can start the middle segment without
-        # waiting for the edge head to become the oldest in batch_queue.
-        # PF was previously delayed via _publish_pre_out_when_ready, but
-        # under pipeline depth>1 the delay caused the cloud to miss PF
-        # (real PF's forward is slow, PRE_OUT never fires before coord
-        # advances to the next step -> cloud never receives PF -> edge PL
-        # tail blocks on irecv forever). With P2P comm pre-creation +
-        # pp_stream isolation + throttle=return True, immediate PF publish
-        # is safe: cloud's irecv is on pp_stream (isolated from compute),
-        # and cloud PassiveScheduler won't block (throttle always True).
-        if scheduler_output.batch_type in (
-            BatchType.DECODE_FIRST, BatchType.PREFILL_FIRST
-        ):
+        # [ascend insert] DECODE_FIRST is published immediately to keep the
+        # decode pipeline full; PREFILL_FIRST is delayed via
+        # _publish_pre_out_when_ready until it becomes next to execute.
+        if scheduler_output.batch_type == BatchType.DECODE_FIRST:
             self._maybe_publish_pre_out(scheduler_output)
         elif scheduler_output.batch_type in (
             BatchType.PREFILL_LAST, BatchType.DECODE_LAST
