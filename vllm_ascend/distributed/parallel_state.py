@@ -65,6 +65,11 @@ def _precreate_pp_p2p_comms(pp_group, backend):
     blocks).  This function does a dummy send/recv on each channel's
     device_group to force communicator creation upfront.
 
+    send/recv are blocking and rendezvous via TCPStore (broadcastMasterID),
+    so they are self-synchronizing -- no barrier needed.  getKeySendRecv
+    is symmetric (min:max), so one send/recv pair creates the P2P comm
+    for both directions.
+
     Uses pp_group.ranks (global ranks) for dst/src, matching how
     edge_cloud_isend/irecv call dist.isend(dst=pp_group.ranks[dst]).
     """
@@ -98,13 +103,15 @@ def _precreate_pp_p2p_comms(pp_group, backend):
     dummy = torch.zeros(1, dtype=torch.float32, device="npu")
 
     for channel_name, device_group in channels:
-        # Barrier: both edge and cloud must be ready before send/recv.
-        torch.distributed.barrier(group=device_group)
-        # Round-trip send/recv creates the P2P communicator for both
-        # directions (getKeySendRecv is symmetric: min:max of the pair).
-        torch.distributed.send(dummy, dst=peer_global, group=device_group)
-        torch.distributed.recv(dummy, src=peer_global, group=device_group)
-        torch.distributed.barrier(group=device_group)
+        # Edge (rank_in_group=0) sends, cloud (rank_in_group=1) receives.
+        # Both block at TCPStore rendezvous until the peer arrives --
+        # self-synchronizing, no barrier needed.  One send/recv pair
+        # creates the P2P comm for both directions (getKeySendRecv is
+        # symmetric: min:max of the two ranks).
+        if rank_in_group == 0:
+            torch.distributed.send(dummy, dst=peer_global, group=device_group)
+        else:
+            torch.distributed.recv(dummy, src=peer_global, group=device_group)
         logger.info(
             "[EdgeCloud] P2P communicator pre-created for channel %s "
             "(local_rank=%s, peer_global=%s)", channel_name,
