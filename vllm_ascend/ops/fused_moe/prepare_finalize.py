@@ -545,14 +545,22 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                 self._dpdbg_moe_nt = int(self.num_tokens)
                 self._dpdbg_moe_e0 = _dpdbg_moe_rec()
                 _dpdbg_moe_ensure_wd()
-            # [DPDBG] Verify HCCL stream is clean BEFORE all_gather.
-            # If this barrier hangs -> a prior op (TP all_reduce, PP
-            # isend/irecv, or previous forward's reduce_scatter) is
-            # stuck on the HCCL stream, blocking all_gather.
-            # If it completes -> all_gather itself is the problem.
+            # [DPDBG] Verify compute stream is idle BEFORE issuing DP barrier.
+            # If npu.synchronize() hangs -> compute stream is stuck (a TP
+            # all_reduce or PP isend on the compute stream didn't complete),
+            # which means DP barrier's syncStreams (waits for compute stream)
+            # will also hang -> indirect dependency chain confirmed.
+            # If npu.synchronize() completes but DP barrier hangs -> DP HCCL
+            # stream itself has a stuck op.
             if not _dpdbg_moe_compiling() and self.moe_config.dp_size > 1:
                 _r0 = _dpdbg_moe_rank()
                 _f0 = getattr(self, "_dpdbg_moe_fid", -1)
+                _dpdbg_moe_logger.error("[DPDBG] hccl_verify: pre_sync r=%s f=%s", _r0, _f0)
+                try:
+                    torch.npu.synchronize()
+                except Exception:
+                    pass
+                _dpdbg_moe_logger.error("[DPDBG] hccl_verify: pre_sync_done r=%s f=%s", _r0, _f0)
                 _dpdbg_moe_logger.error("[DPDBG] hccl_verify: before_ag r=%s f=%s", _r0, _f0)
                 try:
                     dist.barrier(group=self.moe_config.dp_group.device_group)
