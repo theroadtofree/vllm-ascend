@@ -56,6 +56,61 @@ _EDGE_CLOUD_TENSOR_META_C2E: "EdgeCloudTensorMeta | None" = None
 _EDGE_CLOUD_TENSOR_META: "EdgeCloudTensorMeta | None" = None
 
 
+def _precreate_pp_p2p_comms(pp_group, backend):
+    """Pre-create P2P HCCL communicators for all PP channels (2P1D).
+
+    ProcessGroupHCCL lazily creates P2P communicators on first send/recv.
+    In PD-separation with pipeline depth>1, this lazy creation can deadlock
+    (cloud reaches irecv before edge reaches isend, TCPStore rendezvous
+    blocks).  This function does a dummy send/recv on each channel's
+    device_group to force communicator creation upfront.
+
+    Uses pp_group.ranks (global ranks) for dst/src, matching how
+    edge_cloud_isend/irecv call dist.isend(dst=pp_group.ranks[dst]).
+    """
+    if pp_group is None or pp_group.world_size <= 1:
+        return
+
+    # Collect (channel_name, device_group) for all 2P1D channels.
+    channels = []
+    # Channel 1: PREFILL_1 (default PP group)
+    if pp_group.device_group is not None:
+        channels.append(("PREFILL_1", pp_group.device_group))
+    # Channel 2: DECODE (alternate group)
+    if pp_group.alt_device_group is not None:
+        channels.append(("DECODE", pp_group.alt_device_group))
+    # Channel 3: PREFILL_2 (hidden channel, if created)
+    if hasattr(pp_group, "_hidden_channel_groups"):
+        try:
+            from vllm.v1.core.sched.output import HiddenChannelType
+            pref2_group, _ = pp_group._hidden_channel_groups(
+                HiddenChannelType.PREFILL_2)
+            if pref2_group is not None:
+                channels.append(("PREFILL_2", pref2_group))
+        except Exception:
+            pass  # PREFILL_2 not configured, skip
+
+    rank_in_group = pp_group.rank_in_group
+    peer_local = 1 - rank_in_group
+    # pp_group.ranks maps local rank -> global rank, e.g. [0,1] or [5,6]
+    peer_global = pp_group.ranks[peer_local]
+
+    dummy = torch.zeros(1, dtype=torch.float32, device="npu")
+
+    for channel_name, device_group in channels:
+        # Barrier: both edge and cloud must be ready before send/recv.
+        torch.distributed.barrier(group=device_group)
+        # Round-trip send/recv creates the P2P communicator for both
+        # directions (getKeySendRecv is symmetric: min:max of the pair).
+        torch.distributed.send(dummy, dst=peer_global, group=device_group)
+        torch.distributed.recv(dummy, src=peer_global, group=device_group)
+        torch.distributed.barrier(group=device_group)
+        logger.info(
+            "[EdgeCloud] P2P communicator pre-created for channel %s "
+            "(local_rank=%s, peer_global=%s)", channel_name,
+            rank_in_group, peer_global)
+
+
 @dataclass
 class EdgeCloudTensorMeta:
     """Pre-computed tensor metadata for edge-cloud hidden state transfer.
@@ -367,6 +422,18 @@ def init_ascend_model_parallel(
             pp_group.create_alternate_groups(backend)
             if hasattr(pp_group, "create_hidden_channel_groups"):
                 pp_group.create_hidden_channel_groups(backend)
+
+            # Pre-create P2P HCCL communicators for all PP channels (2P1D).
+            # ProcessGroupHCCL creates P2P communicators lazily on first
+            # send/recv via getHCCLComm -> broadcastMasterID -> TCPStore.
+            # In PD-separation with pipeline depth>1, the lazy creation can
+            # deadlock: cloud reaches irecv before edge reaches isend, and
+            # the TCPStore rendezvous blocks until the peer publishes its
+            # master ID.  By doing a dummy send/recv on each channel at
+            # init time (both sides synchronized via barrier), we force the
+            # P2P communicator creation upfront, eliminating the lazy-build
+            # timeout window.
+            _precreate_pp_p2p_comms(pp_group, backend)
 
         # Ascend-specific groups that are currently disabled by default
         # in edge-cloud mode. If enabled in the future, they must follow
