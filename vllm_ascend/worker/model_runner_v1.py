@@ -3958,18 +3958,24 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens_padded, input_ids, positions, intermediate_tensors,
                 inputs_embeds, **model_kwargs,
             )
-            # [PD-FIX] Sync compute stream (transitively waits for HCCL ops
-            # on DP/EP group streams via event dependencies) after each
-            # forward, BEFORE the next forward's HCCL ops are queued. This
-            # prevents cross-forward HCCL op interleaving on the DP and EP
-            # HCCL streams, which under pipeline depth>1 can form a cross-
-            # stream circular wait (DP-stream all_gather <-> EP-stream a2a)
-            # that deadlocks. Cost: loses cross-forward overlap, but within-
-            # forward compute-HCCL overlap is preserved. Dummy path's .item()
-            # already does this sync; this adds it for the REAL path.
+            # [PD-FIX] Flush HCCL streams after each forward via dist.barrier().
+            # barrier is a HCCL collective that runs ON the HCCL stream (not
+            # the DEFAULT compute stream), forcing all prior HCCL ops
+            # (all_gather, reduce_scatter on DP stream; a2a on EP stream) to
+            # complete before the next forward's ops are queued. Unlike
+            # current_stream().synchronize() (which syncs DEFAULT stream and
+            # may not wait for the HCCL stream), barrier directly flushes the
+            # HCCL stream. Both DPs must call it (coord 1:1 ensures they do).
             try:
-                if not torch.compiler.is_compiling():
-                    torch.npu.current_stream().synchronize()
+                if not torch.compiler.is_compiling() and self.dp_size > 1:
+                    # Flush DP group HCCL stream (all_gather/reduce_scatter)
+                    dist.barrier(group=get_dp_group().device_group)
+                    # Flush EP group HCCL stream (a2a) if MC2 initialized
+                    from vllm_ascend.distributed.parallel_state import _MC2
+                    if _MC2 is not None:
+                        _mc2_dg = getattr(_MC2, 'device_group', None)
+                        if _mc2_dg is not None:
+                            dist.barrier(group=_mc2_dg)
             except Exception:
                 pass
             return _result
