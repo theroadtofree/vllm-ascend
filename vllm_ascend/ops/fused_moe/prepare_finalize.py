@@ -548,16 +548,6 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             # All-gather across DP group
             hidden_states = self.moe_config.dp_group.all_gather(hidden_states, 0)
             router_logits = self.moe_config.dp_group.all_gather(router_logits, 0)
-            # [DPDBG] Verify all_gather completed via barrier on DP HCCL stream
-            if not _dpdbg_moe_compiling() and self.moe_config.dp_size > 1:
-                _r = _dpdbg_moe_rank()
-                _f = getattr(self, "_dpdbg_moe_fid", -1)
-                _dpdbg_moe_logger.error("[DPDBG] hccl_verify: after_ag r=%s f=%s", _r, _f)
-                try:
-                    dist.barrier(group=self.moe_config.dp_group.device_group)
-                except Exception:
-                    pass
-                _dpdbg_moe_logger.error("[DPDBG] hccl_verify: ag_done r=%s f=%s", _r, _f)
             # [DPDBG] e1: after all_gather; precise sync if VLLM_DPDBG_MOE_SYNC=1
             if not _dpdbg_moe_compiling():
                 self._dpdbg_moe_e1 = _dpdbg_moe_rec()
@@ -641,16 +631,6 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         Returns:
             Tensor with shape [original_local_num_tokens, hidden_size]
         """
-        # [DPDBG] Verify a2a completed (a2a runs between _prepare and _finalize)
-        if not _dpdbg_moe_compiling() and self.moe_config.dp_size > 1:
-            _r = _dpdbg_moe_rank()
-            _f = getattr(self, "_dpdbg_moe_fid", -1)
-            _dpdbg_moe_logger.error("[DPDBG] hccl_verify: after_a2a r=%s f=%s", _r, _f)
-            try:
-                torch.npu.synchronize()
-            except Exception:
-                pass
-            _dpdbg_moe_logger.error("[DPDBG] hccl_verify: a2a_done r=%s f=%s", _r, _f)
         if self.moe_config.dp_size > 1 and not self.enable_shared_expert_dp:
             # [DPDBG] e2: before reduce_scatter (a2a done boundary);
             # precise sync here (VLLM_DPDBG_MOE_SYNC=1) localizes a2a vs rs.
@@ -658,16 +638,6 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             _dpdbg_moe_sync_log("pre_rs")
             hidden_states = get_dp_group().reduce_scatter(hidden_states, 0)
             hidden_states = hidden_states[: self.num_tokens]
-            # [DPDBG] Verify reduce_scatter completed
-            if not _dpdbg_moe_compiling():
-                _r2 = _dpdbg_moe_rank()
-                _f2 = getattr(self, "_dpdbg_moe_fid", -1)
-                _dpdbg_moe_logger.error("[DPDBG] hccl_verify: after_rs r=%s f=%s", _r2, _f2)
-                try:
-                    dist.barrier(group=get_dp_group().device_group)
-                except Exception:
-                    pass
-                _dpdbg_moe_logger.error("[DPDBG] hccl_verify: rs_done r=%s f=%s", _r2, _f2)
             # [DPDBG] e3: after reduce_scatter; append full entry to history.
             if not _dpdbg_moe_compiling():
                 _dpdbg_e3 = _dpdbg_moe_rec()
