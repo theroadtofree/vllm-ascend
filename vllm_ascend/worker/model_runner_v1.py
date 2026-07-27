@@ -4263,6 +4263,26 @@ class NPUModelRunner(GPUModelRunner):
         # tensor copies that require inference mode.  Wrap the whole
         # preparation inside inference_mode to stay compatible with
         # PyTorch >= 2.0 inference tensor protection.
+        # [DPDBG] query prev segc's default-stream events before .to() stalls.
+        # segc_done=False => prev segc GDN/expert not finished
+        # ag_done=False => GDN not finished; ag_done=True + segc_done=False =>
+        #   all_gather not paired (expert waiting on hccl)
+        # rs_done=False => expert/reduce_scatter not finished
+        from vllm_ascend.ascend_forward_context import _EXTRA_CTX as _EC_PREP
+        _evt_segc = getattr(_EC_PREP, "_dpdbg_segc_evt", None)
+        _evt_ag = getattr(_EC_PREP, "_dpdbg_ag_evt", None)
+        _evt_rs = getattr(_EC_PREP, "_dpdbg_rs_evt", None)
+        try:
+            _r = dist.get_rank() if dist.is_initialized() else -1
+        except Exception:
+            _r = -1
+        logger.error(
+            "[DPDBG] cloud_prep_pre_to r=%s segc_done=%s ag_done=%s rs_done=%s",
+            _r,
+            _evt_segc.query() if _evt_segc is not None else "?",
+            _evt_ag.query() if _evt_ag is not None else "?",
+            _evt_rs.query() if _evt_rs is not None else "?",
+        )
         with torch.inference_mode():
             cache = self._run_input_preparation(scheduler_output)
 
@@ -4850,6 +4870,14 @@ class NPUModelRunner(GPUModelRunner):
                 "[DPDBG] segc EXIT r=%s bt=%s hs_type=%s",
                 _seg_r, _seg_bt, type(hidden_states).__name__,
             )
+        # [DPDBG] default-stream event after seg_c. query in next
+        # cloud_prepare_early: segc_done=False => prev segc's default-stream
+        # ops (GDN+expert) not finished => .to() stalls on them.
+        try:
+            _EXTRA_CTX._dpdbg_segc_evt = torch.npu.Event()
+            _EXTRA_CTX._dpdbg_segc_evt.record()
+        except Exception:
+            pass
         if seg_c_graph and not forward_context.capturing:
             self._update_full_graph_params_if_needed(
                 forward_context, num_tokens_padded, positions,

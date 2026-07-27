@@ -604,6 +604,15 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                 int(self.num_tokens), int(max_tokens_across_dp),
                 hidden_states.shape, router_logits.shape,
             )
+            # [DPDBG] default-stream event after all_gather submit. query in
+            # cloud_prepare_early: ag_done=False => GDN not finished;
+            # ag_done=True + segc_done=False => all_gather not paired (expert
+            # waiting on hccl).
+            try:
+                _EXTRA_CTX._dpdbg_ag_evt = torch.npu.Event()
+                _EXTRA_CTX._dpdbg_ag_evt.record()
+            except Exception:
+                pass
             # [DPDBG] e1: after all_gather; precise sync if VLLM_DPDBG_MOE_SYNC=1
             if not _dpdbg_moe_compiling():
                 self._dpdbg_moe_e1 = _dpdbg_moe_rec()
@@ -714,6 +723,11 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                 int(self.num_tokens), -1,
                 hidden_states.shape, hidden_states.shape,
             )
+            try:
+                _EXTRA_CTX._dpdbg_rs_evt = torch.npu.Event()
+                _EXTRA_CTX._dpdbg_rs_evt.record()
+            except Exception:
+                pass
             hidden_states = hidden_states[: self.num_tokens]
             # [DPDBG] e3: after reduce_scatter; append full entry to history.
             if not _dpdbg_moe_compiling():
