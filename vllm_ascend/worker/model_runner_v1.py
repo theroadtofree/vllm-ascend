@@ -4840,6 +4840,26 @@ class NPUModelRunner(GPUModelRunner):
                 None if layer_slice_info is None else
                 f"{layer_slice_info.slice_index}/{layer_slice_info.total_slices}",
             )
+        # [2P1D-fix] Cross-DP barrier before seg_c: force dummy(1 token) to
+        # wait for real(1024 token) to reach the same seg_c, keeping their
+        # seg_c count 1:1. Without this, dummy's default stream (1-token
+        # forward) drains fast and dummy's CPU commits the next seg_c's
+        # all_gather on hcclStreams_ ahead of real, while real is still
+        # stuck in cloud_prepare_early (.to() blocked by the previous seg_c's
+        # 1024-token compute on default stream). dummy's all_gather then
+        # waits for real's all_gather that never comes -> cross-DP all_gather
+        # count drift (dummy N+1 vs real N) -> deadlock. The barrier makes
+        # dummy block at CPU until real also reaches its seg_c, eliminating
+        # the 1-seg_c lead. sync_metadata's all_reduce (also a barrier) is
+        # NOT enough because real runs it inside cloud_prepare_early, which
+        # completes before real's .to() stalls - so dummy's sync_meta pairs
+        # and proceeds to seg_c while real still hasn't reached seg_c.
+        if (self._edge_cloud_enabled
+            and self.edge_cloud_cfg.role == "cloud"
+            and self.dp_size > 1):
+            _dp_grp = get_dp_group()
+            if _dp_grp is not None:
+                dist.barrier(group=_dp_grp.cpu_group)
         hidden_states = seg_c(
             positions=positions,
             intermediate_tensors=intermediate_tensors,
