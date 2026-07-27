@@ -58,6 +58,16 @@ _DPDBG_MOE_CTR = [0]
 _DPDBG_MOE_LOCK = _threading.Lock()
 _DPDBG_MOE_WD = [False]
 _DPDBG_MOE_SYNC = _os.environ.get("VLLM_DPDBG_MOE_SYNC") == "1"
+# [DPDBG] Per-all-gather entry+shape log (CPU-side; does NOT perturb the
+# deadlock stream). Unlike e0..e3 events (recorded on the current stream
+# while HCCL runs on hcclStreams_, so they can read done before the
+# collective completes), this logs on the submitting CPU thread right
+# before/after the collective is *submitted* - exact about whether the
+# collective was reached and what shape it was submitted with.
+# Distinguishes:
+#   - dummy never entered all_gather  -> no ENTER line with bt=0
+#   - entered but real still hangs    -> ENTER printed, compare shape vs real
+_DPDBG_MOE_SHAPE = _os.environ.get("VLLM_DPDBG_MOE_SHAPE") == "1"
 
 
 def _dpdbg_moe_rank():
@@ -99,6 +109,31 @@ def _dpdbg_moe_sync_log(label):
     try:
         torch.npu.synchronize()
         _dpdbg_moe_logger.error("[DPDBG] moe_sync %s done r=%s", label, _dpdbg_moe_rank())
+    except Exception:
+        pass
+
+
+def _dpdbg_moe_shape_log(tag, bt, nt, mtad, hs_shape, rl_shape, extra=""):
+    """CPU-side entry+shape log around the MoE all_gather call.
+
+    Runs on the submitting CPU thread, NOT on hcclStreams_, so it neither
+    perturbs the deadlock nor suffers the event-on-wrong-stream imprecision.
+    `bt` = dp_batch_type_id (0=DUMMY, 1=PF, 2=PL, 3=DF, 4=DL) lets you tell
+    dummy vs real lines apart; `nt` = local num_tokens (pre-pad), `mtad` =
+    max_tokens_across_dp (pad target). Compare across DP ranks at the same
+    step: if mtad/shape differ, all_gather input sizes mismatch -> never
+    pairs (size bug); if dummy has no ENTER line at all, it never reached
+    all_gather (skipped earlier in the dummy forward path).
+    """
+    if not _DPDBG_MOE_SHAPE or _dpdbg_moe_compiling():
+        return
+    try:
+        _dpdbg_moe_logger.error(
+            "[DPDBG] moe_ag %s r=%s bt=%s nt=%s mtad=%s hs=%s rl=%s%s",
+            tag, _dpdbg_moe_rank(), bt, nt, mtad,
+            tuple(hs_shape), tuple(rl_shape),
+            (" " + extra) if extra else "",
+        )
     except Exception:
         pass
 
@@ -469,6 +504,11 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             # per-token activations in prepare. Keep quantization in the MoE MLP path.
             pass
 
+        _dpdbg_moe_shape_log(
+            "ENTER_ep", getattr(_EXTRA_CTX, "dp_batch_type_id", -1),
+            int(hidden_states.shape[0]), -1,
+            hidden_states.shape, router_logits.shape,
+        )
         if self.multistream_overlap_gate:
             assert PrepareAndFinalize.quant_stream is not None
             PrepareAndFinalize.quant_stream.wait_stream(torch.npu.current_stream())
@@ -477,6 +517,11 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         else:
             hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states, True, True)
             router_logits = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(router_logits, True, True)
+        _dpdbg_moe_shape_log(
+            "EXIT_ep", getattr(_EXTRA_CTX, "dp_batch_type_id", -1),
+            int(hidden_states.shape[0]), -1,
+            hidden_states.shape, router_logits.shape,
+        )
 
         # TODO(fuzhihong): To adapt to self.num_token in the all_gather_input_id_with_dp_group method,
         #  when flashcomm1 is used and dp = N(N >=2).
@@ -546,8 +591,19 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                 self._dpdbg_moe_e0 = _dpdbg_moe_rec()
                 _dpdbg_moe_ensure_wd()
             # All-gather across DP group
+            _dpdbg_moe_shape_log(
+                "ENTER_dp", getattr(_EXTRA_CTX, "dp_batch_type_id", -1),
+                int(self.num_tokens), int(max_tokens_across_dp),
+                hidden_states.shape, router_logits.shape,
+                extra=f"dp_size={self.moe_config.dp_size}",
+            )
             hidden_states = self.moe_config.dp_group.all_gather(hidden_states, 0)
             router_logits = self.moe_config.dp_group.all_gather(router_logits, 0)
+            _dpdbg_moe_shape_log(
+                "EXIT_dp", getattr(_EXTRA_CTX, "dp_batch_type_id", -1),
+                int(self.num_tokens), int(max_tokens_across_dp),
+                hidden_states.shape, router_logits.shape,
+            )
             # [DPDBG] e1: after all_gather; precise sync if VLLM_DPDBG_MOE_SYNC=1
             if not _dpdbg_moe_compiling():
                 self._dpdbg_moe_e1 = _dpdbg_moe_rec()
