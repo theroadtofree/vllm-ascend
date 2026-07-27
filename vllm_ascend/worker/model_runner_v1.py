@@ -539,8 +539,12 @@ class NPUModelRunner(GPUModelRunner):
             self.segment_a_wrapper: Any = None
             self.segment_e_wrapper: Any = None
             self.segment_c_wrapper: Any = None
-            # Cache segment_a prepare results for segment_e reuse (edge-cloud only)
-            self._edge_prepare_cache: dict | None = None
+            # Cache segment_a prepare results for segment_e reuse (edge-cloud only).
+            # Keyed by head_token (not single-slot) so 2P1D - two prefills in
+            # flight (P1首/P2首) with possibly out-of-order P尾 returns - matches
+            # each tail to its own head's cached attn_metadata/batch_desc, not
+            # whichever prefill wrote a single-slot cache last.
+            self._edge_prepare_cache: dict[str, dict] = {}
             # Cache cloud-side prepare results to overlap with edge segment_a
             self._cloud_prepare_cache: dict | None = None
         else:
@@ -2564,15 +2568,33 @@ class NPUModelRunner(GPUModelRunner):
         # NOTE: if an intervening EMPTY batch cleared input_batch, we must
         # fall through to the normal path so _update_states can re-add the
         # requests before sampling.
+        # 2P1D: segment_e (P尾/D尾) must reuse the prepare result cached by
+        # *its own* head segment (matched by head_token), not whichever
+        # prefill wrote the single-slot cache last. With two prefills in
+        # flight (P1首/P2首) and out-of-order PL returns, a req_ids-only check
+        # can match the wrong tail to the wrong cache.
+        _tail_head_token = getattr(scheduler_output, "head_token", None)
         _fast_path = (
             self._edge_cloud_enabled
             and self.edge_cloud_cfg.role == "edge"
             and intermediate_tensors is not None
-            and self._edge_prepare_cache is not None
+            and _tail_head_token is not None
+            and _tail_head_token in self._edge_prepare_cache
             and self.input_batch.num_reqs > 0
             and tuple(self.input_batch.req_ids)
             == tuple(scheduler_output.num_scheduled_tokens)
         )
+        # 2P1D: a tail that misses fast path (e.g. req_ids mismatch when two
+        # prefills are in flight) re-prepares on the slow path, so its cached
+        # entry is no longer needed - drop it to avoid leaking the
+        # attn_metadata / device tensors it holds. head_token is unique per
+        # batch, so this is hygiene, not correctness.
+        if (self._edge_cloud_enabled
+            and self.edge_cloud_cfg.role == "edge"
+            and intermediate_tensors is not None
+            and not _fast_path
+            and _tail_head_token is not None):
+            self._edge_prepare_cache.pop(_tail_head_token, None)
         # ---- cloud fast path: reuse pre-computed prepare results ----
         _cloud_fast_path = (
             self._edge_cloud_enabled
@@ -2581,8 +2603,9 @@ class NPUModelRunner(GPUModelRunner):
             and self._cloud_prepare_cache is not None
         )
         if _fast_path:
-            cache = self._edge_prepare_cache
-            self._edge_prepare_cache = None  # consumed, clear for next iteration
+            cache = self._edge_prepare_cache.pop(_tail_head_token)
+            # consumed: only this head_token's entry is removed; other
+            # in-flight prefills' caches are preserved for 2P1D.
             total_num_scheduled_tokens = cache["total_num_scheduled_tokens"]
             num_tokens_padded = cache["num_tokens_padded"]
             num_tokens_across_dp = cache["num_tokens_across_dp"]
@@ -2878,18 +2901,20 @@ class NPUModelRunner(GPUModelRunner):
         if (self._edge_cloud_enabled
             and self.edge_cloud_cfg.role == "edge"
             and intermediate_tensors is None):
-            self._edge_prepare_cache = {
-                "num_tokens_padded": num_tokens_padded,
-                "num_tokens_across_dp": num_tokens_across_dp,
-                "attn_metadata": attn_metadata,
-                "logits_indices": logits_indices,
-                "spec_decode_metadata": spec_decode_metadata,
-                "spec_decode_common_attn_metadata": spec_decode_common_attn_metadata,
-                "cudagraph_mode": cudagraph_mode,
-                "batch_desc": batch_desc,
-                "cudagraph_stats": cudagraph_stats,
-                "total_num_scheduled_tokens": total_num_scheduled_tokens,
-            }
+            _head_token = getattr(scheduler_output, "head_token", None)
+            if _head_token is not None:
+                self._edge_prepare_cache[_head_token] = {
+                    "num_tokens_padded": num_tokens_padded,
+                    "num_tokens_across_dp": num_tokens_across_dp,
+                    "attn_metadata": attn_metadata,
+                    "logits_indices": logits_indices,
+                    "spec_decode_metadata": spec_decode_metadata,
+                    "spec_decode_common_attn_metadata": spec_decode_common_attn_metadata,
+                    "cudagraph_mode": cudagraph_mode,
+                    "batch_desc": batch_desc,
+                    "cudagraph_stats": cudagraph_stats,
+                    "total_num_scheduled_tokens": total_num_scheduled_tokens,
+                }
             logger.error(
                 "[DPDBG] head_cache: tnst=%s ntad=%s ntp=%s",
                 total_num_scheduled_tokens, num_tokens_across_dp, num_tokens_padded,
