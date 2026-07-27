@@ -673,7 +673,17 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         2 Reduce_results is True usually happens when model has no shared experts. We still do reduce scatter
         here, then skip allreudce in FusedMoe.
         """
+        _dpdbg_moe_shape_log(
+            "ENTER_rs_ep", getattr(_EXTRA_CTX, "dp_batch_type_id", -1),
+            int(hidden_states.shape[0]), -1,
+            hidden_states.shape, hidden_states.shape,
+        )
         hidden_states = torch.ops.vllm.maybe_pad_and_reduce(hidden_states, True)
+        _dpdbg_moe_shape_log(
+            "EXIT_rs_ep", getattr(_EXTRA_CTX, "dp_batch_type_id", -1),
+            int(hidden_states.shape[0]), -1,
+            hidden_states.shape, hidden_states.shape,
+        )
 
         return hidden_states
 
@@ -692,7 +702,18 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             # precise sync here (VLLM_DPDBG_MOE_SYNC=1) localizes a2a vs rs.
             _dpdbg_e2 = _dpdbg_moe_rec() if not _dpdbg_moe_compiling() else None
             _dpdbg_moe_sync_log("pre_rs")
+            _dpdbg_moe_shape_log(
+                "ENTER_rs", getattr(_EXTRA_CTX, "dp_batch_type_id", -1),
+                int(self.num_tokens), -1,
+                hidden_states.shape, hidden_states.shape,
+                extra=f"dp_size={self.moe_config.dp_size}",
+            )
             hidden_states = get_dp_group().reduce_scatter(hidden_states, 0)
+            _dpdbg_moe_shape_log(
+                "EXIT_rs", getattr(_EXTRA_CTX, "dp_batch_type_id", -1),
+                int(self.num_tokens), -1,
+                hidden_states.shape, hidden_states.shape,
+            )
             hidden_states = hidden_states[: self.num_tokens]
             # [DPDBG] e3: after reduce_scatter; append full entry to history.
             if not _dpdbg_moe_compiling():
