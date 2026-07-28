@@ -1123,29 +1123,26 @@ def edge_cloud_irecv_tensor_dict(
         # comm_postprocess list so it runs *after* the irecv handle is
         # waited on by AsyncIntermediateTensors.wait_for_comm().
         merged = _allocate_merged_recv_buffer(ec_meta, num_tokens)
-        # When SP is on, `merged` is padded up to a TP multiple; the sender
-        # only transmits the actual num_tokens rows, so irecv into a view of
-        # the leading num_tokens rows (mirrors the non-merge SP path).  When
-        # SP is off this view is the whole buffer, a no-op.
         recv_view = merged[:num_tokens]
         _pps = _get_pp_comm_stream()
-        # Zero-fill the SP padding tail BEFORE irecv. The padding region
-        # (merged[num_tokens:]) is not touched by irecv (only recv_view =
-        # merged[:num_tokens] is written). Doing this before irecv avoids an
-        # implicit cross-stream sync: if .zero_() runs on the default stream
-        # AFTER irecv is submitted on _pps, the PyTorch caching allocator
-        # detects that `merged` has a pending op on _pps and implicitly
-        # inserts wait_stream(_pps) on the default stream. This blocks the
-        # default stream until irecv completes, which in 2P1D (where edge
-        # may not have sent P首 yet) deadlocks cloud_prepare_early's .to().
-        # Zeroing before irecv is safe because irecv only writes recv_view
-        # (the first num_tokens rows), not the padding tail.
         if merged.shape[0] > num_tokens:
             merged[num_tokens:].zero_()
+        # [DPDBG] Granular events to pinpoint which op blocks default stream
+        import logging as _dbg_log
+        _dbg_logger = _dbg_log.getLogger("vllm")
+        from vllm_ascend.ops.fused_moe.prepare_finalize import _DPDBG_EVTS
+        _ev_alloc = torch.npu.Event(); _ev_alloc.record()
+        _DPDBG_EVTS["irecv_pre"] = _ev_alloc
         with torch.npu.stream(_pps):
             handle = torch.distributed.irecv(
                 recv_view, src=pp_group.ranks[src], group=group
             )
+        _ev_irecv = torch.npu.Event(); _ev_irecv.record()
+        _DPDBG_EVTS["irecv_post"] = _ev_irecv
+        _dbg_logger.error(
+            "[DPDBG] irecv_check alloc_done=%s irecv_pre_done=%s irecv_post_done=%s",
+            _ev_alloc.query(), _ev_alloc.query(), _ev_irecv.query(),
+        )
         recv_view.record_stream(_pps)
         # NO compute.wait_stream(pp_stream): the irecv handle is waited
         # CPU-side by AsyncIntermediateTensors.wait_for_comm() (lazy,
