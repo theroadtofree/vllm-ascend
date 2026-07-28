@@ -821,15 +821,36 @@ def _get_edge_cloud_hidden_channel_device_group(
 #   isend: pp_stream.wait_stream(compute) before isend (data must be ready)
 #   irecv: compute.wait_stream(pp_stream) after irecv (data must be received)
 _pp_comm_stream: Any = None
+_pp_comm_streams_by_channel: dict[Any, Any] = {}
 
 
-def _get_pp_comm_stream() -> Any:
-    """Lazy-init the dedicated PP communication stream."""
-    global _pp_comm_stream
-    if _pp_comm_stream is None:
+def _get_pp_comm_stream(channel: Any = None) -> Any:
+    """Lazy-init the dedicated PP communication stream.
+
+    When ``channel`` is provided, returns a per-channel stream so that
+    isend/irecv on different hidden channels (PREFILL_1 vs PREFILL_2) do
+    not serialize on a single stream. In 2P1D, cloud sends P2尾 on
+    prefill_2 (isend) and receives P3首 on prefill_1 (irecv). If both
+    share one _pps stream, irecv P3首 is queued behind isend P2尾 and
+    cannot start until isend P2尾 completes (i.e., edge irecv's P2尾).
+    When edge is idle (2P1D breaks P尾回边 sync), isend P2尾 never
+    completes, irecv P3首 never starts, and the NPU runtime's irecv
+    blocks the default stream -> deadlock. Per-channel streams break this
+    ordering: irecv P3首 on _pps_prefill_1 proceeds independently of
+    isend P2尾 on _pps_prefill_2.
+    """
+    if channel is None:
+        global _pp_comm_stream
+        if _pp_comm_stream is None:
+            import torch_npu
+            _pp_comm_stream = torch_npu.npu.Stream()
+        return _pp_comm_stream
+    s = _pp_comm_streams_by_channel.get(channel)
+    if s is None:
         import torch_npu
-        _pp_comm_stream = torch_npu.npu.Stream()
-    return _pp_comm_stream
+        s = torch_npu.npu.Stream()
+        _pp_comm_streams_by_channel[channel] = s
+    return s
 
 
 def edge_cloud_isend_tensor_dict(
@@ -963,7 +984,7 @@ def edge_cloud_isend_tensor_dict(
             "was initialized with inconsistent per-tensor shapes; re-init "
             "it or unset VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD."
         )
-        _pps = _get_pp_comm_stream()
+        _pps = _get_pp_comm_stream(channel)
         # pp_stream waits for compute stream: the merged buffer is produced
         # by the model forward (compute stream); isend must not read it
         # before the forward completes.
@@ -976,7 +997,7 @@ def edge_cloud_isend_tensor_dict(
         handles.append(handle)
         return handles
 
-    _pps = _get_pp_comm_stream()
+    _pps = _get_pp_comm_stream(channel)
     _pps.wait_stream(torch.npu.current_stream())
     for key in send_keys:
         value = tensor_dict[key]
@@ -1124,25 +1145,13 @@ def edge_cloud_irecv_tensor_dict(
         # waited on by AsyncIntermediateTensors.wait_for_comm().
         merged = _allocate_merged_recv_buffer(ec_meta, num_tokens)
         recv_view = merged[:num_tokens]
-        _pps = _get_pp_comm_stream()
+        _pps = _get_pp_comm_stream(channel)
         if merged.shape[0] > num_tokens:
             merged[num_tokens:].zero_()
-        # [DPDBG] Granular events to pinpoint which op blocks default stream
-        import logging as _dbg_log
-        _dbg_logger = _dbg_log.getLogger("vllm")
-        from vllm_ascend.ops.fused_moe.prepare_finalize import _DPDBG_EVTS
-        _ev_alloc = torch.npu.Event(); _ev_alloc.record()
-        _DPDBG_EVTS["irecv_pre"] = _ev_alloc
         with torch.npu.stream(_pps):
             handle = torch.distributed.irecv(
                 recv_view, src=pp_group.ranks[src], group=group
             )
-        _ev_irecv = torch.npu.Event(); _ev_irecv.record()
-        _DPDBG_EVTS["irecv_post"] = _ev_irecv
-        _dbg_logger.error(
-            "[DPDBG] irecv_check alloc_done=%s irecv_pre_done=%s irecv_post_done=%s",
-            _ev_alloc.query(), _ev_alloc.query(), _ev_irecv.query(),
-        )
         recv_view.record_stream(_pps)
         # NO compute.wait_stream(pp_stream): the irecv handle is waited
         # CPU-side by AsyncIntermediateTensors.wait_for_comm() (lazy,
@@ -1180,7 +1189,7 @@ def edge_cloud_irecv_tensor_dict(
     recv_num_tokens = _pad_num_tokens_to_tp_multiple(num_tokens)
     send_keys = set(ec_meta.send_tensor_keys or ec_meta.tensor_keys)
 
-    _pps = _get_pp_comm_stream()
+    _pps = _get_pp_comm_stream(channel)
     for key, value in ec_meta.metadata_list:
         if isinstance(value, TensorMetadata):
             # Replace the placeholder dim-0 with the TP-padded size; the
