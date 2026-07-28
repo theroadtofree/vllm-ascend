@@ -106,13 +106,20 @@ class PPSchedulerZmqPublisher:
         self._ctx = zmq.Context.instance()
         self._push = self._ctx.socket(zmq.PUSH)
         self._push.set_hwm(1000)
+        # IMMEDIATE=1: block send until a PULL peer is connected, instead of
+        # queuing messages for a not-yet-connected peer. Without this, the
+        # first message sent right after bind (before PULL connects) is
+        # silently lost — the root cause of the 2P1D deadlock where P1首
+        # (PRE_OUT seq=0) never reaches cloud, P1中 never executes, P1尾
+        # POST_OUT is never published, and edge blocks forever waiting for it.
+        self._push.setsockopt(zmq.IMMEDIATE, 1)
         # Bind if wildcard (pp rank0), otherwise connect
         if "*" in endpoint or "::" in endpoint:
             self._push.bind(endpoint)
         else:
             self._push.connect(endpoint)
 
-        logger.info("PP Scheduler ZMQ publisher started on %s", endpoint)
+        logger.info("PP Scheduler ZMQ publisher started on %s (IMMEDIATE=1)", endpoint)
 
         # Start background publisher thread
         self._thread = threading.Thread(
