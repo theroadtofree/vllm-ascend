@@ -1129,6 +1129,19 @@ def edge_cloud_irecv_tensor_dict(
         # SP is off this view is the whole buffer, a no-op.
         recv_view = merged[:num_tokens]
         _pps = _get_pp_comm_stream()
+        # Zero-fill the SP padding tail BEFORE irecv. The padding region
+        # (merged[num_tokens:]) is not touched by irecv (only recv_view =
+        # merged[:num_tokens] is written). Doing this before irecv avoids an
+        # implicit cross-stream sync: if .zero_() runs on the default stream
+        # AFTER irecv is submitted on _pps, the PyTorch caching allocator
+        # detects that `merged` has a pending op on _pps and implicitly
+        # inserts wait_stream(_pps) on the default stream. This blocks the
+        # default stream until irecv completes, which in 2P1D (where edge
+        # may not have sent P首 yet) deadlocks cloud_prepare_early's .to().
+        # Zeroing before irecv is safe because irecv only writes recv_view
+        # (the first num_tokens rows), not the padding tail.
+        if merged.shape[0] > num_tokens:
+            merged[num_tokens:].zero_()
         with torch.npu.stream(_pps):
             handle = torch.distributed.irecv(
                 recv_view, src=pp_group.ranks[src], group=group
@@ -1142,12 +1155,6 @@ def edge_cloud_irecv_tensor_dict(
         # sync) wait for the irecv, re-creating the cross-batch pipeline
         # cycle (edge tail gdn -> irecv -> cloud isend -> cloud a2a ->
         # cloud gdn -> cloud irecv -> edge isend -> edge a2a -> prev batch).
-        # Zero-fill the SP padding tail (see the non-merge path for why).
-        # The merged buffer is TP-broadcast and split into per-key tensors,
-        # so the tail padding flows into every per-key tensor; it must be
-        # zero before the broadcast reads it.
-        if merged.shape[0] > num_tokens:
-            merged[num_tokens:].zero_()
 
         # Pre-populate the dict with empty placeholders so callers can see
         # the expected keys even before postprocess runs.  We replace them
@@ -1192,26 +1199,20 @@ def edge_cloud_irecv_tensor_dict(
 
             if key in send_keys:
                 recv_view = full_tensor[:num_tokens]
+                # Zero-fill the SP padding tail BEFORE irecv (same fix as
+                # the merge_payload path). .zero_() after irecv creates an
+                # implicit wait_stream(_pps) on the default stream via the
+                # caching allocator, deadlocking in 2P1D when irecv is
+                # pending. Safe before irecv: irecv only writes recv_view
+                # (first num_tokens rows), not the padding tail.
+                if recv_num_tokens > num_tokens:
+                    full_tensor[num_tokens:].zero_()
                 with torch.npu.stream(_pps):
                     handle = torch.distributed.irecv(
                         recv_view, src=pp_group.ranks[src], group=group
                     )
                 recv_view.record_stream(_pps)
                 handles.append(handle)
-                # Zero-fill the SP padding tail.  The sender only transmits
-                # the real num_tokens rows; the remaining
-                # (recv_num_tokens - num_tokens) rows are padding to satisfy
-                # SP's TP-divisibility and must be zero, not torch.empty's
-                # uninitialized memory.  Garbage here is read by downstream
-                # ops that iterate over the full TP-padded buffer (SP
-                # all-gather inside attention, DSA compression, hc_head/norm)
-                # and probabilistically corrupts batched requests on 3D
-                # (DeepSeek V4) models.  Runs on the compute stream
-                # concurrent with the HCCL irecv (disjoint regions); the
-                # irecv handle wait plus the next HCCL op's compute->HCCL
-                # sync make it visible before any read.
-                if recv_num_tokens > num_tokens:
-                    full_tensor[num_tokens:].zero_()
             else:
                 # The sender skipped this tensor (e.g. the zero residual in
                 # embedding_only e2c). Keep the buffer zeroed so the model
