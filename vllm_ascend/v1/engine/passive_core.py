@@ -151,6 +151,18 @@ class PPSchedulerZmqPublisher:
             )
 
     def _publisher_thread(self) -> None:
+        # Warmup: send a dummy message to prime the zmq pipe. The first
+        # message after pipe establishment can be lost due to zmq's
+        # internal handshake race (TCP connected but zmq handshake
+        # incomplete, even with IMMEDIATE=1). The subscriber discards
+        # the warmup (scheduler_output=None). If the warmup is lost, no
+        # harm; the next real message goes through the fully established
+        # pipe.
+        try:
+            self._push.send_multipart((b"\xff" * 8, pickle.dumps(None)))
+            logger.info("PP Scheduler ZMQ warmup sent")
+        except Exception:
+            logger.exception("PP Scheduler ZMQ warmup send failed")
         while self._running or self._queue.qsize() > 0:
             try:
                 item = self._queue.get(timeout=0.1)
@@ -238,6 +250,11 @@ class PPSchedulerZmqSubscriber:
                 seq_bytes, data = self._pull.recv_multipart()
                 seq = int.from_bytes(seq_bytes, "big")
                 scheduler_output = pickle.loads(data)
+                # Warmup message (None) sent by publisher to prime the
+                # zmq pipe. Discard it.
+                if scheduler_output is None:
+                    logger.info("PP Scheduler ZMQ warmup received, pipe primed")
+                    continue
                 if scheduler_output.batch_type is BatchType.EMPTY:
                     continue
                 with self._lock:
