@@ -132,6 +132,12 @@ class PPSchedulerZmqPublisher:
             seq = self._seq
             self._seq += 1
             self._queue.put_nowait((seq, scheduler_output))
+            _ht = getattr(scheduler_output, "head_token", "?")
+            logger.error(
+                "[DPDBG] zmq_pub ENQUEUE seq=%s bt=%s ht=%s qsize=%s",
+                seq, scheduler_output.batch_type.value, _ht,
+                self._queue.qsize(),
+            )
         except queue.Full:
             logger.warning(
                 "PP Scheduler ZMQ publish queue full, dropping message"
@@ -154,7 +160,16 @@ class PPSchedulerZmqPublisher:
                     )
                     continue
                 seq_bytes = seq.to_bytes(8, "big")
+                _ht = getattr(scheduler_output, "head_token", "?")
+                logger.error(
+                    "[DPDBG] zmq_pub SEND seq=%s bt=%s ht=%s",
+                    seq, scheduler_output.batch_type.value, _ht,
+                )
                 self._push.send_multipart((seq_bytes, data))
+                logger.error(
+                    "[DPDBG] zmq_pub SEND_DONE seq=%s ht=%s",
+                    seq, _ht,
+                )
             except queue.Empty:
                 continue
             except Exception:
@@ -220,16 +235,20 @@ class PPSchedulerZmqSubscriber:
                     continue
                 with self._lock:
                     self._received_outputs.append((seq, scheduler_output))
+                _ht = getattr(scheduler_output, "head_token", "?")
+                _bt = scheduler_output.batch_type
                 logger.info(
                     "PP rank1 received SchedulerOutput seq=%d, "
                     "total_scheduled_tokens=%d, "
                     "new_reqs=%d, cached_reqs=%d, "
-                    "finished_req_ids=%s",
+                    "finished_req_ids=%s, bt=%s, ht=%s",
                     seq,
                     scheduler_output.total_num_scheduled_tokens,
                     len(scheduler_output.scheduled_new_reqs),
                     scheduler_output.scheduled_cached_reqs.num_reqs,
                     scheduler_output.finished_req_ids,
+                    _bt.value if _bt is not None else "<none>",
+                    _ht,
                 )
             except zmq.ZMQError:
                 if self._running:
