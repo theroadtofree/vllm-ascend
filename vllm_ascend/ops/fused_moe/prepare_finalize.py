@@ -110,15 +110,15 @@ def _dpdbg_moe_wd():
         try:
             with _DPDBG_MOE_LOCK:
                 items = list(_DPDBG_MOE_HIST)
-            for fid, rank, bt, lyr, mtad, nt, e0, e1, e2, e3 in items[-8:]:
+            for fid, rank, bt, lyr, e0, e1, e2, e3 in items[-8:]:
                 q0 = _dpdbg_moe_q(e0); q1 = _dpdbg_moe_q(e1)
                 q2 = _dpdbg_moe_q(e2); q3 = _dpdbg_moe_q(e3)
                 if q0 == 1 and q1 == 1 and q2 == 1 and q3 == 1:
                     continue  # fully complete - skip to reduce idle noise
                 _dpdbg_moe_logger.error(
-                    "[DPDBG] moe_evt fwd=%s r=%s bt=%s lyr=%s mtad=%s nt=%s "
-                    "e0(pre-ag)=%s e1(ag_done)=%s e2(a2a_done)=%s e3(rs_done)=%s",
-                    fid, rank, bt, lyr, mtad, nt, q0, q1, q2, q3,
+                    "[DPDBG] moe_evt fwd=%s r=%s bt=%s lyr=%s e0(pre-ag)=%s "
+                    "e1(ag_done)=%s e2(a2a_done)=%s e3(rs_done)=%s",
+                    fid, rank, bt, lyr, q0, q1, q2, q3,
                 )
         except Exception:
             pass
@@ -534,15 +534,6 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                 except Exception:
                     self._dpdbg_moe_bt = -1
                     self._dpdbg_moe_lyr = -1
-                # [DPDBG] mtad = max_tokens_across_dp (pad target), nt = local
-                # num_tokens (pre-pad). Compare across DP: if mtad differs,
-                # all_gather input sizes mismatch -> never pairs (size bug, not
-                # count drift).
-                try:
-                    self._dpdbg_moe_mtad = int(max_tokens_across_dp)
-                except Exception:
-                    self._dpdbg_moe_mtad = -1
-                self._dpdbg_moe_nt = int(self.num_tokens)
                 self._dpdbg_moe_e0 = _dpdbg_moe_rec()
                 _dpdbg_moe_ensure_wd()
             # All-gather across DP group
@@ -647,8 +638,6 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                         _dpdbg_moe_rank(),
                         getattr(self, "_dpdbg_moe_bt", -1),
                         getattr(self, "_dpdbg_moe_lyr", -1),
-                        getattr(self, "_dpdbg_moe_mtad", -1),
-                        getattr(self, "_dpdbg_moe_nt", -1),
                         getattr(self, "_dpdbg_moe_e0", None),
                         getattr(self, "_dpdbg_moe_e1", None),
                         _dpdbg_e2,
