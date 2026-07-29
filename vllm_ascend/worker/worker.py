@@ -835,17 +835,6 @@ class NPUWorker(WorkerBase):
                 or not self.model_runner.supports_mm_inputs)
             merge_payload = get_edge_cloud_tensor_meta().merge_payload
             channel = self._hidden_channel_for(scheduler_output)
-            # [DPDBG] Record default-stream event BEFORE cloud_recv to detect
-            # if the default stream was already blocked from the previous step.
-            # If pre_recv_done=False, the previous seg_c's ops haven't finished
-            # on the default stream (segc_done=True may be stale/inaccurate).
-            try:
-                from vllm_ascend.ops.fused_moe.prepare_finalize import _DPDBG_EVTS
-                _pre_evt = torch.npu.Event()
-                _pre_evt.record()
-                _DPDBG_EVTS["pre_recv"] = _pre_evt
-            except Exception:
-                pass
             # In the shared-model edge-cloud topology the edge
             # has a single distributed rank at in-group rank 0;
             # the cloud first-worker of each dp_rank must
