@@ -869,16 +869,6 @@ class NPUWorker(WorkerBase):
                 getattr(scheduler_output, "head_token", "?"),
                 channel.value, scheduler_output.total_num_scheduled_tokens,
             )
-            # [DPDBG] default-stream event after cloud_recv. query in
-            # cloud_prepare_early: recv_done=False => recv's handles still on
-            # default stream => .to() stalls on recv.
-            try:
-                from vllm_ascend.ops.fused_moe.prepare_finalize import _DPDBG_EVTS
-                _evt = torch.npu.Event()
-                _evt.record()
-                _DPDBG_EVTS["recv"] = _evt
-            except Exception:
-                pass
 
             self.model_runner.cloud_prepare_early(scheduler_output)
             if do_sp_chunk and not merge_payload:

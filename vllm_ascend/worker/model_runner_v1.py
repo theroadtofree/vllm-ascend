@@ -4288,18 +4288,16 @@ class NPUModelRunner(GPUModelRunner):
         _evt_segc = _DPDBG_EVTS.get("segc")
         _evt_ag = _DPDBG_EVTS.get("ag")
         _evt_rs = _DPDBG_EVTS.get("rs")
-        _evt_recv = _DPDBG_EVTS.get("recv")
         try:
             _r = dist.get_rank() if dist.is_initialized() else -1
         except Exception:
             _r = -1
         logger.error(
-            "[DPDBG] cloud_prep_pre_to r=%s segc_done=%s ag_done=%s rs_done=%s recv_done=%s",
+            "[DPDBG] cloud_prep_pre_to r=%s segc_done=%s ag_done=%s rs_done=%s",
             _r,
             _evt_segc.query() if _evt_segc is not None else "?",
             _evt_ag.query() if _evt_ag is not None else "?",
             _evt_rs.query() if _evt_rs is not None else "?",
-            _evt_recv.query() if _evt_recv is not None else "?",
         )
         with torch.inference_mode():
             cache = self._run_input_preparation(scheduler_output)
