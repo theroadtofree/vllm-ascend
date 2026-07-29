@@ -34,17 +34,6 @@ _DPDBG_A2A_COUNT = 0
 
 
 def dpdbg_moe_a2a_tick(label: str = "a2a"):
-    # Skip when torch.compile/torchdynamo is tracing: a logging.Logger call
-    # inside a compiled region raises "logging.Logger method not supported for
-    # non-export cases". This tick is an eager-time diagnostic only (e.g. the
-    # dummy forward path, which runs eager); the compiled real-forward path
-    # becomes a no-op here, which is fine - real-forward counts come from the
-    # PassiveScheduler recv log (outside the compiled region).
-    try:
-        if torch.compiler.is_compiling():
-            return
-    except Exception:
-        pass
     global _DPDBG_A2A_COUNT
     _DPDBG_A2A_COUNT += 1
     try:
