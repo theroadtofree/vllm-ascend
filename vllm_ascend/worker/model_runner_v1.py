@@ -4865,38 +4865,11 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 forward_context.moe_layer_index = moe_start
 
-        # [DPDBG] seg_c entry/exit log (VLLM_DPDBG_SEGC=1). Localizes whether a
-        # dummy forward that entered _model_forward (skip_head=False) actually
-        # reaches and returns from seg_c. If "segc EXIT" prints for bt=0 but
-        # no moe_ag ENTER_dp/ENTER_ep (from prepare_finalize.py) follows, seg_c
-        # completed WITHOUT invoking the MoE all_gather -> dummy never paired
-        # the real cloud's collective (the 2P1D deadlock path). seg_type tells
-        # ACLGraph vs eager vs raw; a shape mismatch on ACLGraph capture is a
-        # prime suspect for dummy skipping MoE.
-        _dpdbg_segc = os.environ.get("VLLM_DPDBG_SEGC") == "1"
-        if _dpdbg_segc:
-            try:
-                _seg_r = dist.get_rank() if dist.is_initialized() else -1
-            except Exception:
-                _seg_r = -1
-            _seg_bt = getattr(_EXTRA_CTX, "dp_batch_type_id", -1)
-            logger.error(
-                "[DPDBG] segc ENTER r=%s bt=%s seg_type=%s ntp=%s slice=%s",
-                _seg_r, _seg_bt, type(seg_c).__name__, num_tokens_padded,
-                None if layer_slice_info is None else
-                f"{layer_slice_info.slice_index}/{layer_slice_info.total_slices}",
-            )
-
         hidden_states = seg_c(
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             **model_kwargs,
         )
-        if _dpdbg_segc:
-            logger.error(
-                "[DPDBG] segc EXIT r=%s bt=%s hs_type=%s",
-                _seg_r, _seg_bt, type(hidden_states).__name__,
-            )
         if seg_c_graph and not forward_context.capturing:
             self._update_full_graph_params_if_needed(
                 forward_context, num_tokens_padded, positions,
