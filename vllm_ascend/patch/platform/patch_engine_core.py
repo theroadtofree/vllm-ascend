@@ -341,31 +341,60 @@ def _is_coordinated_dp(self) -> bool:
 
 
 def _coordinate_bt(
-    self, intended_bt: BatchType, local_unfinished: bool
+    self, intended_bt: BatchType, local_unfinished: bool,
+    local_has_work_waiting: bool = False,
 ) -> tuple[BatchType, bool]:
-    """All-reduce intended batch_type AND has_unfinished across DPs in ONE
-    all_reduce on dp_group, every step. Returns (winner, engines_running).
+    """All-reduce intended batch_type, has_unfinished, and a decode-waiting
+    flag across DPs in ONE all_reduce on dp_group, every step. Returns
+    (winner, engines_running).
 
-    Combining the two exchanges into a single per-step all_reduce (instead of
-    a coord all_reduce every step + a has_unfinished all_reduce every 32
-    steps) eliminates the desync window: engines_running is recomputed every
-    step on both DPs from the same all_reduce, so the two DPs always agree on
-    running/idle -> they pause together. The old 32-step has_unfinished skip
-    left engines_running stale-True between all_reduces; if the two DPs'
-    step_counters diverged even briefly, one DP stayed stale-True (looping in
-    coord) while the other went False (paused) -> the looping DP blocked in
-    coord waiting for the paused DP -> hang risk under sustained load.
+    Layout (SUM-gather, same trick as model_runner
+    _sync_metadata_across_dp):
+      [bt_id_0 .. bt_id_{n-1},
+       wait_0  .. wait_{n-1},     # 1 if DP r has real decode work but
+                                  # intended EMPTY (waiting for its
+                                  # DECODE_LAST to return from cloud)
+       unfinished_local]          # SUM = count of running DPs
+    Each rank fills its own bt_id and wait slots (others 0); every rank
+    adds its 0/1 unfinished at the last slot.
 
-    Rule: winner = lowest-dp_rank DP with real (non-EMPTY) intent (dp0
+    Default winner = lowest-dp_rank DP with non-EMPTY intent (dp0
     priority); all EMPTY -> EMPTY. engines_running = OR(local_unfinished)
-    (sum > 0). Each DP then force-schedules the winner (real if it has such
-    work, else a dummy of the winner bt).
+    (sum > 0). Each DP then force-schedules the winner (real if it has
+    such work, else a dummy of the winner bt).
 
-    Reuses the EngineCore stateless dp_group (same communicator the worker
-    uses for sync_metadata). Safe because coord mode runs this single
-    all_reduce every step on both DPs (no second all_reduce stream, no
-    32-step skip, no `continue` skip - the busy loop gates `continue` on
-    `not _is_coordinated_dp()`), so the per-group call count is always paired.
+    Decode phase alignment (ONLY when BOTH DPs are on the decode side,
+    i.e. every intended in {EMPTY, DECODE_FIRST, DECODE_LAST}; prefill
+    PF/PL is left to the default rule):
+
+      Rule 2 - any DP has DECODE_LAST ready -> winner = DECODE_LAST.
+        Lets the lagging DP finish its DL (real) while the DF-ready DP
+        waits (dummy DL); next step both can DF together. Without this
+        the DF-ready DP (usually dp0) grabs the step as DF and the peer's
+        DL never runs -> phase stays skewed -> perpetual
+        one-real-one-dummy.
+
+      Rule 1 - one DP DF-ready, the other EMPTY *with waiting decode
+        work* -> winner = EMPTY this step. Defers the DF so neither runs
+        a dummy DF; once the waiting DP's DL arrives (-> Rule 2 -> real
+        DL) both DPs reach DF together next step -> two real DF, dummy
+        eliminated. If the EMPTY peer is truly idle (no waiting work),
+        keep default DF so the dummy still pairs the cross-DP EP
+        all-toall (necessary).
+
+    Trade-off: alignment makes the leading DP wait (1-2 dummy/empty
+    steps) for the lagging DP to catch up. Under balanced load this
+    removes the steady-state one-real-one-dummy (edge dummy segment_a +
+    cloud dummy full middle), ~2x decode throughput. Under cloud-return
+    jitter or skewed load the leading DP may stall waiting, hurting
+    latency - so Rule 1 only fires when the EMPTY peer actually has
+    decode work waiting, never when idle.
+
+    Reuses the EngineCore stateless dp_group (same communicator the
+    worker uses for sync_metadata). Safe because coord mode runs this
+    single all_reduce every step on both DPs (the busy loop gates
+    `continue` on `not _is_coordinated_dp()`), so the per-group call
+    count is always paired.
     """
     import torch
     dp_group = getattr(self, "dp_group", None)
@@ -374,33 +403,54 @@ def _coordinate_bt(
     parallel_config = self.vllm_config.parallel_config
     dp_size = parallel_config.data_parallel_size
     dp_rank = parallel_config.data_parallel_rank
-    # Layout: [bt_id_0 .. bt_id_{dp_size-1}, unfinished_local].
-    # Each rank fills its own bt_id index (others 0) so SUM gathers per-rank
-    # bt_id; every rank adds its 0/1 unfinished at the last slot so SUM there
-    # = count of running DPs (>0 => engines_running). Same SUM-gather trick
-    # as model_runner _sync_metadata_across_dp.
-    tensor = torch.zeros(dp_size + 1, dtype=torch.int32, device="cpu")
+    # Layout: [bt_id_0..bt_id_{n-1}, wait_0..wait_{n-1}, unfinished].
+    # Each rank fills its own bt_id and wait index (others 0) so SUM
+    # gathers per-rank values; every rank adds its 0/1 unfinished at the
+    # last slot so SUM there = count of running DPs (>0 => engines_running).
+    tensor = torch.zeros(2 * dp_size + 1, dtype=torch.int32, device="cpu")
     tensor[dp_rank] = _BT_COORD_ID.get(intended_bt, 0)
-    tensor[dp_size] = 1 if local_unfinished else 0
+    tensor[dp_size + dp_rank] = 1 if local_has_work_waiting else 0
+    tensor[2 * dp_size] = 1 if local_unfinished else 0
     _cnt = getattr(self, "_coord_bt_count", 0) + 1
     self._coord_bt_count = _cnt
     torch.distributed.all_reduce(tensor, group=dp_group)
+    bt_ids = [int(tensor[r].item()) for r in range(dp_size)]
+    waitings = [int(tensor[dp_size + r].item()) for r in range(dp_size)]
+    _engines_running = int(tensor[2 * dp_size].item()) > 0
+
+    # Default: lowest-dp_rank non-EMPTY intended (dp0 priority).
     winner_id = 0
     for r in range(dp_size):
-        rid = int(tensor[r].item())
-        if rid != 0:
-            winner_id = rid
+        if bt_ids[r] != 0:
+            winner_id = bt_ids[r]
             break
+
+    _DL = _BT_COORD_ID[BatchType.DECODE_LAST]
+    _DF = _BT_COORD_ID[BatchType.DECODE_FIRST]
+    _E = _BT_COORD_ID[BatchType.EMPTY]
+    # Decode phase alignment - only when no DP is on the prefill side
+    # (PF/PL). Prefill phases keep the default lowest-rank rule.
+    if all(b in (_E, _DF, _DL) for b in bt_ids):
+        if _DL in bt_ids:
+            # Rule 2: let the DP with a ready DL run it (real); the
+            # DF-ready peer runs a dummy DL so both align on DF next step.
+            winner_id = _DL
+        elif _DF in bt_ids and _E in bt_ids:
+            # Rule 1: defer DF when the EMPTY peer is waiting on its DL
+            # (has decode work). If the EMPTY peer is truly idle, fall
+            # through to the default DF so the dummy pairs the a2a.
+            if any(bt_ids[r] == _E and waitings[r] for r in range(dp_size)):
+                winner_id = _E
+
     _winner = _BT_COORD_ID_INV.get(winner_id, BatchType.EMPTY)
-    _engines_running = int(tensor[dp_size].item()) > 0
     # Throttle: log every 32 calls and whenever real work is coordinated.
     if _cnt % 32 == 0 or winner_id != 0:
         logger.error(
             "[DPDBG][COORD] dp_rank=%s count=%s intended=%s winner=%s "
-            "engines_running=%s",
+            "engines_running=%s bt_ids=%s waitings=%s",
             dp_rank, _cnt,
             _BT_COORD_ID.get(intended_bt, 0), _BT_COORD_ID.get(_winner, 0),
-            int(_engines_running),
+            int(_engines_running), bt_ids, waitings,
         )
     return _winner, _engines_running
 
@@ -512,8 +562,18 @@ def _patched_step_with_batch_queue(self):
         _has_req = self.scheduler.has_requests()
         _has_bq = bool(self.batch_queue)
         _local_has_work = _has_req or _has_bq
+        # has_work_waiting: this DP has real decode work (running reqs) but
+        # intended EMPTY this step -> it is waiting for its DECODE_LAST to
+        # return from cloud, NOT truly idle. Lets _coordinate_bt defer a
+        # peer's DECODE_FIRST (Rule 1) so both DPs align on DF instead of
+        # spinning one-real-one-dummy. running[] empty + EMPTY == truly
+        # idle -> False (peer keeps default DF + dummy to pair the a2a).
+        _has_work_waiting = (
+            bool(getattr(self.scheduler, "running", None))
+            and _intended_batch_type == BatchType.EMPTY
+        )
         _coord_winner, _coord_engines_running = self._coordinate_bt(
-            _intended_batch_type, _local_has_work
+            _intended_batch_type, _local_has_work, _has_work_waiting
         )
         vllm_logger.error(f"step_cnt={self.step_cnt} _coord_winner={_coord_winner} _intended_batch_type={_intended_batch_type}")
         self._coord_engines_running = _coord_engines_running
