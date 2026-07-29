@@ -35,7 +35,6 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
 from vllm_ascend.flash_common3_context import get_flash_common3_context, set_flash_common3_context
-from vllm_ascend.ops.fused_moe.comm_utils import dpdbg_moe_a2a_tick
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, setup_moe_comm_method
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
@@ -576,11 +575,6 @@ class AscendFusedMoE(FusedMoE):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # [DPDBG] per-MoE-layer forward counter (universal: covers MC2 / All2All
-        # / AllGather / FusedMC2, which all route through here). Used to detect
-        # cross-DP divergence between cloud DPs. Compare rank1 (dp0 cloud) vs
-        # rank6 (dp1 cloud) count sequences.
-        dpdbg_moe_a2a_tick("moe_fwd")
         self.ensure_moe_quant_config_init()
         return self.runner.forward(
             hidden_states,
