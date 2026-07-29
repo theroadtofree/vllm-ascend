@@ -72,7 +72,6 @@ _DPDBG_MOE_SHAPE = _os.environ.get("VLLM_DPDBG_MOE_SHAPE") == "1"
 # per-forward (context-local), so events set on it in seg_c's forward don't
 # persist to the next cloud_prepare_early. Use this module-level dict.
 _DPDBG_EVTS = {}
-_DPDBG_AG_COUNT = [0]  # global all_gather call counter (per-process)
 
 
 def _dpdbg_moe_rank():
@@ -596,14 +595,6 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                 self._dpdbg_moe_e0 = _dpdbg_moe_rec()
                 _dpdbg_moe_ensure_wd()
             # All-gather across DP group
-            _DPDBG_AG_COUNT[0] += 1
-            _dp_rank = getattr(_EXTRA_CTX, "dp_rank", -1)
-            _bt = getattr(_EXTRA_CTX, "dp_batch_type_id", -1)
-            import logging as _ag_log
-            _ag_log.getLogger("vllm").error(
-                "[DPDBG] all_gather CALL dp_rank=%s count=%s bt=%s nt=%s",
-                _dp_rank, _DPDBG_AG_COUNT[0], _bt, int(self.num_tokens),
-            )
             _dpdbg_moe_shape_log(
                 "ENTER_dp", getattr(_EXTRA_CTX, "dp_batch_type_id", -1),
                 int(self.num_tokens), int(max_tokens_across_dp),
@@ -616,10 +607,6 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                 "EXIT_dp", getattr(_EXTRA_CTX, "dp_batch_type_id", -1),
                 int(self.num_tokens), int(max_tokens_across_dp),
                 hidden_states.shape, router_logits.shape,
-            )
-            _ag_log.getLogger("vllm").error(
-                "[DPDBG] all_gather DONE dp_rank=%s count=%s bt=%s",
-                _dp_rank, _DPDBG_AG_COUNT[0], _bt,
             )
             # [DPDBG] default-stream event after all_gather submit. query in
             # cloud_prepare_early: ag_done=False => GDN not finished;
