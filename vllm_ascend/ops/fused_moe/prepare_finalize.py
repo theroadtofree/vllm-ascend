@@ -68,10 +68,6 @@ _DPDBG_MOE_SYNC = _os.environ.get("VLLM_DPDBG_MOE_SYNC") == "1"
 #   - dummy never entered all_gather  -> no ENTER line with bt=0
 #   - entered but real still hangs    -> ENTER printed, compare shape vs real
 _DPDBG_MOE_SHAPE = _os.environ.get("VLLM_DPDBG_MOE_SHAPE") == "1"
-# [DPDBG] module-level dict for cross-forward event sharing. _EXTRA_CTX is
-# per-forward (context-local), so events set on it in seg_c's forward don't
-# persist to the next cloud_prepare_early. Use this module-level dict.
-_DPDBG_EVTS = {}
 
 
 def _dpdbg_moe_rank():
@@ -613,9 +609,8 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             # ag_done=True + segc_done=False => all_gather not paired (expert
             # waiting on hccl).
             try:
-                _evt = torch.npu.Event()
-                _evt.record()
-                _DPDBG_EVTS["ag"] = _evt
+                _EXTRA_CTX._dpdbg_ag_evt = torch.npu.Event()
+                _EXTRA_CTX._dpdbg_ag_evt.record()
             except Exception:
                 pass
             # [DPDBG] e1: after all_gather; precise sync if VLLM_DPDBG_MOE_SYNC=1
@@ -729,9 +724,8 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                 hidden_states.shape, hidden_states.shape,
             )
             try:
-                _evt = torch.npu.Event()
-                _evt.record()
-                _DPDBG_EVTS["rs"] = _evt
+                _EXTRA_CTX._dpdbg_rs_evt = torch.npu.Event()
+                _EXTRA_CTX._dpdbg_rs_evt.record()
             except Exception:
                 pass
             hidden_states = hidden_states[: self.num_tokens]

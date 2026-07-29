@@ -4284,10 +4284,10 @@ class NPUModelRunner(GPUModelRunner):
         # ag_done=False => GDN not finished; ag_done=True + segc_done=False =>
         #   all_gather not paired (expert waiting on hccl)
         # rs_done=False => expert/reduce_scatter not finished
-        from vllm_ascend.ops.fused_moe.prepare_finalize import _DPDBG_EVTS
-        _evt_segc = _DPDBG_EVTS.get("segc")
-        _evt_ag = _DPDBG_EVTS.get("ag")
-        _evt_rs = _DPDBG_EVTS.get("rs")
+        from vllm_ascend.ascend_forward_context import _EXTRA_CTX as _EC_PREP
+        _evt_segc = getattr(_EC_PREP, "_dpdbg_segc_evt", None)
+        _evt_ag = getattr(_EC_PREP, "_dpdbg_ag_evt", None)
+        _evt_rs = getattr(_EC_PREP, "_dpdbg_rs_evt", None)
         try:
             _r = dist.get_rank() if dist.is_initialized() else -1
         except Exception:
@@ -4921,10 +4921,8 @@ class NPUModelRunner(GPUModelRunner):
         # cloud_prepare_early: segc_done=False => prev segc's default-stream
         # ops (GDN+expert) not finished => .to() stalls on them.
         try:
-            from vllm_ascend.ops.fused_moe.prepare_finalize import _DPDBG_EVTS
-            _evt = torch.npu.Event()
-            _evt.record()
-            _DPDBG_EVTS["segc"] = _evt
+            _EXTRA_CTX._dpdbg_segc_evt = torch.npu.Event()
+            _EXTRA_CTX._dpdbg_segc_evt.record()
         except Exception:
             pass
         if seg_c_graph and not forward_context.capturing:
