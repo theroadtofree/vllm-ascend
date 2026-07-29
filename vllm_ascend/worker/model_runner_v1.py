@@ -3988,12 +3988,7 @@ class NPUModelRunner(GPUModelRunner):
         **model_kwargs: dict[str, Any],
     ):
         """模型前向入口。标准路径与边云路径完全分离，职责单一。"""
-        # [DPDBG] expose batch_type to MoE prepare/finalize for moe_evt logging.
-        try:
-            from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-            _EXTRA_CTX.dp_batch_type_id = self._dp_batch_type_id
-        except Exception:
-            pass
+
         if self._edge_cloud_enabled:
             return self._edge_cloud_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors,
