@@ -2495,6 +2495,32 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     # Signal sample_tokens to also skip (return EMPTY, not None).
                     self._tail_segment_discarded = True
+                    # [DP-FIX] A discarded tail runs no real forward, but in
+                    # DP>1 the peer DP's step still enters the cross-DP
+                    # all_reduce (_sync_metadata_across_dp) and may run a
+                    # matching segment forward. Returning EMPTY here skips
+                    # both -> the peer's all_reduce deadlocks waiting for a
+                    # collective this DP never enters (the "edge dummy stuck
+                    # at all_reduce" symptom); and if the peer is a real
+                    # tail/head, its segment all_gather would then wait for a
+                    # forward this DP never runs. Run a DUMMY instead (same
+                    # as worker._execute_model_edge_dummy for the idle DP):
+                    # _dummy_run advertises batch_type_id=0 (DUMMY) and calls
+                    # _sync_metadata_across_dp, keeping the all_reduce 1:1.
+                    # Via _peer_batch_type_id it then self-adapts: peer idle
+                    # (peer_bt==0) -> skip the forward (sync only); peer real
+                    # head/tail -> run the matching segment_a/segment_e to
+                    # pair the forward collectives. The tail's real hidden
+                    # was already received by worker._execute_model_edge_tail
+                    # (data-plane contract preserved); _dummy_run on the edge
+                    # uses intermediate_tensors=None, so it ignores that
+                    # hidden and runs a pure dummy. dp_size==1 has no peer to
+                    # pair with, so it keeps the original early return.
+                    if self.dp_size > 1:
+                        self._dummy_run(
+                            num_tokens=self.decode_token_per_req,
+                            uniform_decode=False,
+                        )
                     return EMPTY_MODEL_RUNNER_OUTPUT
                 if stale:
                     # Partial-stale: alive reqs need the step, stale reqs would
