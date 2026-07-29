@@ -546,9 +546,6 @@ def _patched_step_with_batch_queue(self):
         else:
             scheduler_output = self.scheduler.schedule()
         self._hang_last_bt = str(scheduler_output.batch_type)
-        vllm_logger.error(f"step_cnt={self.step_cnt} total_num_scheduled_tokens={scheduler_output.total_num_scheduled_tokens}")
-
-
 
         # [ascend insert] Assign head-token for edge-cloud head-segment
         # batches so the tail-segment can be matched to the suspended
