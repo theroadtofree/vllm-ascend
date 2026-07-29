@@ -941,13 +941,23 @@ class NPUWorker(WorkerBase):
         if get_pp_group().world_size > 1:
             channel = self._hidden_channel_for(scheduler_output)
             _hang_ret_rank = getattr(self.model_runner, "dp_rank", "?")
-            # PD-separation diagnostic: log hidden_states norm at cloud output
+            # PD-separation diagnostic: log cloud output shape only.
+            # Do NOT compute .norm()/.mean().item() here: .item() is a full
+            # stream sync (aclrtSynchronizeStream). In eager mode the compute
+            # stream still has the pending cross-DP MoE a2a wait_event from the
+            # middle forward, so the full sync stalls until that a2a pairs
+            # across DPs; with both DPs hitting this .item() it forms a 2-way
+            # deadlock (DP0 .item -> DP0 a2a -> DP1 a2a -> DP1 .item -> ...).
+            # acl_graph avoids it because the a2a runs on the graph stream, not
+            # the compute stream, so syncing the compute stream doesn't wait for
+            # it. This is the same real-side full-sync cycle the 0722 work
+            # removed for A/C/D; B was missed/re-added. Real side must stay
+            # sync-free (dummy side keeps the .item() 节拍器). shape is sync-free.
             _hs_c = _gathered.get("hidden_states")
             if _hs_c is not None:
                 logger.error(
-                    "[PD-DIAG] B. cloud middle OUTPUT: bt=%s shape=%s norm=%.6f mean=%.6f",
+                    "[PD-DIAG] B. cloud middle OUTPUT: bt=%s shape=%s",
                     scheduler_output.batch_type, list(_hs_c.shape),
-                    float(_hs_c.float().norm().item()), float(_hs_c.float().mean().item()),
                 )
             self._record_pp_send_work(
                 edge_cloud_send_tensor_dict(_gathered, channel=channel,
