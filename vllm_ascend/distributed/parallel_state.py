@@ -1175,8 +1175,23 @@ def edge_cloud_irecv_tensor_dict(
         # comm_postprocess list so it runs *after* the irecv handle is
         # waited on by AsyncIntermediateTensors.wait_for_comm().
         merged = _allocate_merged_recv_buffer(ec_meta, num_tokens)
+        # When SP is on, `merged` is padded up to a TP multiple; the sender
+        # only transmits the actual num_tokens rows, so irecv into a view of
+        # the leading num_tokens rows (mirrors the non-merge SP path).  When
+        # SP is off this view is the whole buffer, a no-op.
         recv_view = merged[:num_tokens]
         _pps = _get_pp_comm_stream(channel, _PP_COMM_RECV)
+        # Zero-fill the SP padding tail BEFORE irecv. The padding region
+        # (merged[num_tokens:]) is not touched by irecv (only recv_view =
+        # merged[:num_tokens] is written). Doing this before irecv avoids an
+        # implicit cross-stream sync: if .zero_() runs on the default stream
+        # AFTER irecv is submitted on _pps, the PyTorch caching allocator
+        # detects that `merged` has a pending op on _pps and implicitly
+        # inserts wait_stream(_pps) on the default stream. This blocks the
+        # default stream until irecv completes, which in 2P1D (where edge
+        # may not have sent P首 yet) deadlocks cloud_prepare_early's .to().
+        # Zeroing before irecv is safe because irecv only writes recv_view
+        # (the first num_tokens rows), not the padding tail.
         if merged.shape[0] > num_tokens:
             merged[num_tokens:].zero_()
         with torch.npu.stream(_pps):

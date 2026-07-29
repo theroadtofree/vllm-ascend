@@ -4270,8 +4270,6 @@ class NPUModelRunner(GPUModelRunner):
         # rs_done=False => expert/reduce_scatter not finished
         from vllm_ascend.ops.fused_moe.prepare_finalize import _DPDBG_EVTS
         _evt_pre_recv = _DPDBG_EVTS.get("pre_recv")
-        _evt_irecv_pre = _DPDBG_EVTS.get("irecv_pre")
-        _evt_irecv_post = _DPDBG_EVTS.get("irecv_post")
         _evt_segc = _DPDBG_EVTS.get("segc")
         _evt_ag = _DPDBG_EVTS.get("ag")
         _evt_rs = _DPDBG_EVTS.get("rs")
@@ -4281,11 +4279,9 @@ class NPUModelRunner(GPUModelRunner):
         except Exception:
             _r = -1
         logger.error(
-            "[DPDBG] cloud_prep_pre_to r=%s pre_recv=%s irecv_pre=%s irecv_post=%s segc=%s ag=%s rs=%s recv=%s",
+            "[DPDBG] cloud_prep_pre_to r=%s pre_recv_done=%s segc_done=%s ag_done=%s rs_done=%s recv_done=%s",
             _r,
             _evt_pre_recv.query() if _evt_pre_recv is not None else "?",
-            _evt_irecv_pre.query() if _evt_irecv_pre is not None else "?",
-            _evt_irecv_post.query() if _evt_irecv_post is not None else "?",
             _evt_segc.query() if _evt_segc is not None else "?",
             _evt_ag.query() if _evt_ag is not None else "?",
             _evt_rs.query() if _evt_rs is not None else "?",
