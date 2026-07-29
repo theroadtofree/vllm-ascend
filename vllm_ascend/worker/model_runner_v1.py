@@ -5774,14 +5774,6 @@ class NPUModelRunner(GPUModelRunner):
                             float(_diag_hs.float().norm().item()),
                             float(_diag_hs.float().mean().item()),
                         )
-                    # 切片到实际需要的 token 数
-                    intermediate_tensors = IntermediateTensors(
-                        {k: v[:intermediate_tokens] for k, v in self.intermediate_tensors.items()}
-                    )
-                    # Zero-fill to avoid NaN from uninitialized memory
-                    # (make_empty_intermediate_tensors may use torch.empty)
-                    for _k, _v in intermediate_tensors.items():
-                        _v.zero_()
             elif get_pp_group().is_first_rank:
                 intermediate_tensors = None
             else:
@@ -5888,6 +5880,18 @@ class NPUModelRunner(GPUModelRunner):
                         )
                         if not layer_slice_info.is_last_slice:
                             _model_kwargs["layer_slice_return_intermediate"] = True
+                    logger.error(
+                        "[MODEL-FWD] _dummy_run _model_forward: "
+                        "layer_slice_info=%s",
+                        None if layer_slice_info is None else {
+                            "start_layer": layer_slice_info.start_layer,
+                            "end_layer": layer_slice_info.end_layer,
+                            "total_slices": layer_slice_info.total_slices,
+                            "slice_index": layer_slice_info.slice_index,
+                            "is_first_slice": layer_slice_info.is_first_slice,
+                            "is_last_slice": layer_slice_info.is_last_slice,
+                        },
+                    )
                     outputs = self._model_forward(
                         num_tokens_padded, input_ids, positions,
                         intermediate_tensors, inputs_embeds,

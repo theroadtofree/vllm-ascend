@@ -965,6 +965,7 @@ class NPUWorker(WorkerBase):
                                             dst=0),
                 channel=channel,
             )
+            import sys as _hang_sys
             logger.error("[HANG] cloud return isend EXIT: dp_rank=%s channel=%s",
                         _hang_ret_rank, channel.value)
             _hang_sys.stderr.flush()

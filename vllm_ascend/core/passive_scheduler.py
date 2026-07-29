@@ -516,7 +516,7 @@ class PassiveScheduler:
         )
 
     def _slice_for(
-        self, so: SchedulerOutput
+        self, so: SchedulerOutput, token_count: int = 0,
     ) -> list["LayerSliceInfo | None"]:
         # Decode-like and empty batches are never sliced. DECODE_FIRST is the
         # edge-cloud head segment of a decode step — same per-token shape as
@@ -527,25 +527,8 @@ class PassiveScheduler:
         ):
             return [None]
 
-        total_slices = self._resolve_slice_count(
-            so.total_num_scheduled_tokens
-        )
-        # Dummy prefill (total_num_scheduled_tokens == 0) needs the same
-        # slice count as the real prefill so both DPs run identical layer
-        # ranges and cross-DP all_reduce stays paired.  When the token
-        # count is zero, _resolve_slice_count returns 0 (no threshold
-        # matched); fall back to the finest-granularity entry in the
-        # YAML config (smallest token threshold -> largest slice count).
-        if total_slices == 0 and so.total_num_scheduled_tokens == 0:
-            if (
-                self._layer_slice_config is not None
-                and len(self._layer_slice_config) > 0
-            ):
-                # _layer_slice_config is sorted descending by token
-                # threshold (e.g. 16, 8, 4, 1, 0).  The last entry has
-                # the smallest threshold and thus the largest slice
-                # count — the most conservative (finest) split.
-                _, total_slices = list(self._layer_slice_config.items())[-1]
+        _tk = token_count if token_count > 0 else so.total_num_scheduled_tokens
+        total_slices = self._resolve_slice_count(_tk)
         # Slicing disabled or trivially 1 slice.
         if total_slices <= 1:
             return [None]
@@ -1059,15 +1042,16 @@ class PassiveScheduler:
         data = bytes(buf_tensor.tolist()).rstrip(b'\x00')
         winner_decision: SchedulerDecision = pickle.loads(data)
 
-        # Non-winner DPs must NOT inherit the winner's stateful fields
-        # (is_continuation, new_state, throttle_action) — those belong
-        # to the winner's own state machine and continuation cycle.
-        # Keep only batch_type and dispatch_queue so the non-winner can
-        # correctly classify its dummy payload.
+        # Non-winner DPs inherit the winner's decision wholesale to stay
+        # in lockstep.
         if _dp_rank != winner_rank:
             return SchedulerDecision(
                 batch_type=winner_decision.batch_type,
                 dispatch_queue=winner_decision.dispatch_queue,
+                is_continuation=winner_decision.is_continuation,
+                token_count=winner_decision.token_count,
+                new_state=winner_decision.new_state,
+                throttle_action=winner_decision.throttle_action,
             )
         return winner_decision
 
@@ -1129,7 +1113,8 @@ class PassiveScheduler:
                         _bt.value, decision.dispatch_queue,
                         len(self.ready_prefills),
                     )
-                return self._build_batch(self.ready_prefills.popleft())
+                return self._build_batch(self.ready_prefills.popleft(),
+                                         decision.token_count)
             if _bt is not None:
                 logger.info(
                     "[APPLY-DECISION] branch=prefill-dummy "
@@ -1151,7 +1136,8 @@ class PassiveScheduler:
                         _bt.value, decision.dispatch_queue,
                         len(self.ready_decodes),
                     )
-                return self._build_batch(self.ready_decodes.popleft())
+                return self._build_batch(self.ready_decodes.popleft(),
+                                         decision.token_count)
             if _bt is not None:
                 logger.info(
                     "[APPLY-DECISION] branch=decode-dummy "
@@ -1173,7 +1159,8 @@ class PassiveScheduler:
                         _bt.value, decision.dispatch_queue,
                         len(self.ready_pdmixes),
                     )
-                return self._build_batch(self.ready_pdmixes.popleft())
+                return self._build_batch(self.ready_pdmixes.popleft(),
+                                         decision.token_count)
             if _bt is not None:
                 logger.info(
                     "[APPLY-DECISION] branch=pdmix-dummy "
@@ -1217,8 +1204,8 @@ class PassiveScheduler:
             return self._build_batch(q.popleft())
         return ScheduledBatch.empty()
 
-    def _build_batch(self, so: SchedulerOutput) -> ScheduledBatch:
-        slices = self._slice_for(so)
+    def _build_batch(self, so: SchedulerOutput, token_count: int = 0) -> ScheduledBatch:
+        slices = self._slice_for(so, token_count)
         if len(slices) <= 1:
             batch = ScheduledBatch(scheduler_output=so, slices=slices)
         else:
