@@ -36,99 +36,6 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEPrepareOutput
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import enable_sp, enable_sp_by_pass, npu_stream_switch, prefill_context_parallel_enable
 
-# [DPDBG] MoE collective instrumentation (dummy+real share this path).
-# (1) Non-blocking torch.npu.Event markers e0..e3 around all_gather/a2a/
-#   reduce_scatter + a watchdog thread that query()s them. record/query add NO
-#   stream sync -> do NOT perturb the deadlock. CAVEAT: HCCL collectives run on
-#   hcclStreams_[key] (per-group), not the current stream, so an event recorded
-#   on the current stream may read done before the collective completes. If all
-#   events read done while .item()@5699 still hangs, mode (1) is inconclusive.
-# (2) Precise per-collective synchronize()+log, env-gated VLLM_DPDBG_MOE_SYNC=1
-#   (PERTURBS the deadlock - debug only). The blocking sync localizes:
-#     ag_done hangs -> all_gather; pre_rs hangs (ag_done passed) -> a2a;
-#     rs_done hangs (pre_rs passed) -> reduce_scatter.
-import os as _os
-import logging as _logging
-import threading as _threading
-from collections import deque as _deque
-
-_dpdbg_moe_logger = _logging.getLogger("vllm")
-_DPDBG_MOE_HIST = _deque(maxlen=64)
-_DPDBG_MOE_CTR = [0]
-_DPDBG_MOE_LOCK = _threading.Lock()
-_DPDBG_MOE_WD = [False]
-_DPDBG_MOE_SYNC = _os.environ.get("VLLM_DPDBG_MOE_SYNC") == "1"
-
-
-def _dpdbg_moe_rank():
-    try:
-        return dist.get_rank() if dist.is_initialized() else -1
-    except Exception:
-        return -1
-
-
-def _dpdbg_moe_compiling():
-    try:
-        return bool(torch.compiler.is_compiling())
-    except Exception:
-        return False
-
-
-def _dpdbg_moe_rec():
-    """Record a non-blocking event on the current stream; None if compiling."""
-    if _dpdbg_moe_compiling():
-        return None
-    try:
-        e = torch.npu.Event()
-        e.record()
-        return e
-    except Exception:
-        return None
-
-
-def _dpdbg_moe_q(e):
-    try:
-        return 1 if (e is not None and e.query()) else (0 if e is not None else -1)
-    except Exception:
-        return -1
-
-
-def _dpdbg_moe_sync_log(label):
-    if not _DPDBG_MOE_SYNC or _dpdbg_moe_compiling():
-        return
-    try:
-        torch.npu.synchronize()
-        _dpdbg_moe_logger.error("[DPDBG] moe_sync %s done r=%s", label, _dpdbg_moe_rank())
-    except Exception:
-        pass
-
-
-def _dpdbg_moe_wd():
-    import time
-    while True:
-        time.sleep(2.0)
-        try:
-            with _DPDBG_MOE_LOCK:
-                items = list(_DPDBG_MOE_HIST)
-            for fid, rank, e0, e1, e2, e3 in items[-8:]:
-                _dpdbg_moe_logger.error(
-                    "[DPDBG] moe_evt fwd=%s r=%s e0(pre-ag)=%s e1(ag_done)=%s "
-                    "e2(a2a_done)=%s e3(rs_done)=%s",
-                    fid, rank, _dpdbg_moe_q(e0), _dpdbg_moe_q(e1),
-                    _dpdbg_moe_q(e2), _dpdbg_moe_q(e3),
-                )
-        except Exception:
-            pass
-
-
-def _dpdbg_moe_ensure_wd():
-    if not _DPDBG_MOE_WD[0]:
-        with _DPDBG_MOE_LOCK:
-            if not _DPDBG_MOE_WD[0]:
-                t = _threading.Thread(target=_dpdbg_moe_wd, daemon=True)
-                t.start()
-                _DPDBG_MOE_WD[0] = True
-
 
 class PrepareAndFinalize(ABC):
     """
@@ -520,20 +427,9 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                 hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, pad_size))
                 router_logits = nn.functional.pad(router_logits, (0, 0, 0, pad_size))
 
-            # [DPDBG] e0: before all_gather
-            if not _dpdbg_moe_compiling():
-                with _DPDBG_MOE_LOCK:
-                    _DPDBG_MOE_CTR[0] += 1
-                    self._dpdbg_moe_fid = _DPDBG_MOE_CTR[0]
-                self._dpdbg_moe_e0 = _dpdbg_moe_rec()
-                _dpdbg_moe_ensure_wd()
             # All-gather across DP group
             hidden_states = self.moe_config.dp_group.all_gather(hidden_states, 0)
             router_logits = self.moe_config.dp_group.all_gather(router_logits, 0)
-            # [DPDBG] e1: after all_gather; precise sync if VLLM_DPDBG_MOE_SYNC=1
-            if not _dpdbg_moe_compiling():
-                self._dpdbg_moe_e1 = _dpdbg_moe_rec()
-            _dpdbg_moe_sync_log("ag_done")
 
         if prefill_context_parallel_enable() and self.moe_config.pcp_size > 1:
             max_tokens_across_pcp = _EXTRA_CTX.max_tokens_across_pcp
@@ -614,25 +510,8 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             Tensor with shape [original_local_num_tokens, hidden_size]
         """
         if self.moe_config.dp_size > 1 and not self.enable_shared_expert_dp:
-            # [DPDBG] e2: before reduce_scatter (a2a done boundary);
-            # precise sync here (VLLM_DPDBG_MOE_SYNC=1) localizes a2a vs rs.
-            _dpdbg_e2 = _dpdbg_moe_rec() if not _dpdbg_moe_compiling() else None
-            _dpdbg_moe_sync_log("pre_rs")
             hidden_states = get_dp_group().reduce_scatter(hidden_states, 0)
             hidden_states = hidden_states[: self.num_tokens]
-            # [DPDBG] e3: after reduce_scatter; append full entry to history.
-            if not _dpdbg_moe_compiling():
-                _dpdbg_e3 = _dpdbg_moe_rec()
-                with _DPDBG_MOE_LOCK:
-                    _DPDBG_MOE_HIST.append((
-                        getattr(self, "_dpdbg_moe_fid", -1),
-                        _dpdbg_moe_rank(),
-                        getattr(self, "_dpdbg_moe_e0", None),
-                        getattr(self, "_dpdbg_moe_e1", None),
-                        _dpdbg_e2,
-                        _dpdbg_e3,
-                    ))
-            _dpdbg_moe_sync_log("rs_done")
 
         if prefill_context_parallel_enable() and self.moe_config.pcp_size > 1:
             hidden_states = get_pcp_group().reduce_scatter(hidden_states, dim=0)
