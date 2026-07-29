@@ -500,20 +500,43 @@ class NPUWorker(WorkerBase):
         else:
             self._pp_send_work_by_channel[channel.value] = handles
 
-    def _wait_pp_send_work(self, channel: HiddenChannelType | None = None) -> None:
+    def _wait_pp_send_work(
+        self,
+        channel: HiddenChannelType | None = None,
+        wait: bool = True,
+    ) -> None:
+        # When wait=False (edge-cloud path), do NOT call handle.wait() on the
+        # isend handles - just drop them. ProcessGroupHCCL internally records
+        # isend inputs on the hccl stream (pointToPoint ->
+        # NPUCachingAllocator::recordStream(tensor, hcclStream),
+        # ProcessGroupHCCL.cpp:4585), so the send buffer's lifetime is safe
+        # without an explicit wait. Calling handle.wait() here would do
+        # hcclEndEvent.block(currentStream=compute/default) (see
+        # WorkHCCL::synchronizeInternal, ProcessGroupHCCL.cpp:1001), re-pinning
+        # the isend completion onto the compute stream regardless of which
+        # Python _pps stream the isend was submitted on - defeating the
+        # per-channel x per-direction _pps split. The compute stream would then
+        # stall until the remote (edge) irecvs the previous P尾, which in 2P1D
+        # (edge busy with the other DP / idle) never happens in time ->
+        # deadlock (log symptom: pre_recv=False recv=False). MindIE discards
+        # the isend handle (_ = isend(...)) for the same reason; this matches
+        # that. Legacy PP keeps wait=True to preserve the original synchronous
+        # behavior.
         if channel is None:
-            for handle in self._pp_send_work:
-                handle.wait()
-            self._pp_send_work = []
-            for handles in self._pp_send_work_by_channel.values():
-                for handle in handles:
+            if wait:
+                for handle in self._pp_send_work:
                     handle.wait()
+                for handles in self._pp_send_work_by_channel.values():
+                    for handle in handles:
+                        handle.wait()
+            self._pp_send_work = []
             self._pp_send_work_by_channel.clear()
             return
 
         handles = self._pp_send_work_by_channel.pop(channel.value, [])
-        for handle in handles:
-            handle.wait()
+        if wait:
+            for handle in handles:
+                handle.wait()
 
     def _all_gather_tensor_dict(
         self,
@@ -569,9 +592,9 @@ class NPUWorker(WorkerBase):
                 BatchType.PREFILL_LAST,
                 BatchType.DECODE_LAST,
             ):
-                self._wait_pp_send_work(self._hidden_channel_for(scheduler_output))
+                self._wait_pp_send_work(self._hidden_channel_for(scheduler_output), wait=False)
             else:
-                self._wait_pp_send_work()
+                self._wait_pp_send_work(wait=False)
         else:
             self._wait_pp_send_work()
 
