@@ -188,12 +188,7 @@ def _drain_pd_channel_inbox(self) -> None:
     new_outputs = self._pp_pd_channel.consume_new_outputs()
     for _seq, so in new_outputs:
         bt = so.batch_type
-        _ht = getattr(so, "head_token", "?")
-        _dp_rank = self.vllm_config.parallel_config.data_parallel_rank
-        logger.error(
-            "[DPDBG] POST_OUT drained dp_rank=%s seq=%s bt=%s ht=%s",
-            _dp_rank, _seq, bt.value if bt is not None else "<none>", _ht,
-        )
+        logger.info(f"Received scheduler_output from cloud, batch_type: {bt}")
         if bt == BatchType.PREFILL_LAST:
             self.scheduler.prefills_last_ready.append(so)
         elif bt == BatchType.DECODE_LAST:
