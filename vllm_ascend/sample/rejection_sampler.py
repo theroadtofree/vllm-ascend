@@ -366,17 +366,28 @@ def rejection_sample(
     else:
         is_greedy = sampling_metadata.temperature == GREEDY_TEMPERATURE
 
-    if HAS_TRITON and pad_len > batch_size:
-        # cu uses a front-guard + tail view (pad_cu_for_kernel): the front guard
-        # makes the offset-1 == -1 tile read at block 0 land in mapped memory
-        # (the actual Ascend fault), and the repeated-last tail makes padded
-        # lanes see num_draft_tokens == 0. is_greedy padded with 1 (greedy) so
-        # the random kernels skip padded lanes; bonus repeats its last row so a
-        # padded greedy lane has a valid bonus source (written into sliced-off
-        # output rows).
+    if HAS_TRITON:
+        # The cu front guard (pad_cu_for_kernel) is required whenever the
+        # Triton kernels run -- even when pad_len == batch_size.  Block 0's
+        # tile read always touches cu_ptr - 1 (masked lanes still issue the
+        # DDR access on Ascend); without the guard a freshly allocated,
+        # page-aligned cu buffer underruns into an unmapped page and trips
+        # "MTE address out of range" (ACL 507035).  Whether base-1 is mapped
+        # depends on the allocator state, which is why the crash was
+        # intermittent and correlated with batch sizes that exactly fill
+        # grid*block_size (e.g. 80 requests).
         cu_num_draft_tokens_k = pad_cu_for_kernel(cu_num_draft_tokens, pad_len)
-        bonus_token_ids_k = pad_tail_to(bonus_token_ids, pad_len, repeat_last=True)
-        is_greedy_k = None if is_greedy is None else pad_tail_to(is_greedy, pad_len, fill=1)
+        if pad_len > batch_size:
+            # Tail padding makes padded lanes see num_draft_tokens == 0.
+            # is_greedy padded with 1 (greedy) so the random kernels skip
+            # padded lanes; bonus repeats its last row so a padded greedy
+            # lane has a valid bonus source (written into sliced-off output
+            # rows).
+            bonus_token_ids_k = pad_tail_to(bonus_token_ids, pad_len, repeat_last=True)
+            is_greedy_k = None if is_greedy is None else pad_tail_to(is_greedy, pad_len, fill=1)
+        else:
+            bonus_token_ids_k = bonus_token_ids
+            is_greedy_k = is_greedy
     else:
         cu_num_draft_tokens_k = cu_num_draft_tokens
         bonus_token_ids_k = bonus_token_ids
