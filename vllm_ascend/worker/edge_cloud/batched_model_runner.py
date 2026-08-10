@@ -1604,6 +1604,27 @@ class BatchedModelRunner(NPUModelRunner):
         bs = self.block_size
         num_kv_cache_gids = len(self.kv_cache_config.kv_cache_groups)
 
+        # ---- Debug 1: check per-dp_rank num_blocks consistency.
+        _per_dp_num_blocks = getattr(self, "_per_dp_num_blocks", None)
+        if _per_dp_num_blocks is not None:
+            _num_blocks_vals = list(_per_dp_num_blocks.values())
+            _num_blocks_min = min(_num_blocks_vals) if _num_blocks_vals else -1
+            _num_blocks_max = max(_num_blocks_vals) if _num_blocks_vals else -1
+            logger.info(
+                "[PD_DEBUG][NUM_BLOCKS] dp_ranks=%s per_dp_num_blocks=%s "
+                "min=%d max=%d global_num_blocks=%d dp_size=%d "
+                "global_cache_slots=%d",
+                batched_dp_ranks, dict(_per_dp_num_blocks),
+                _num_blocks_min, _num_blocks_max,
+                getattr(self, "_global_num_blocks", -1), dp_size,
+                getattr(self, "_global_num_blocks", -1) * bs)
+            if _num_blocks_max > _num_blocks_min:
+                logger.warning(
+                    "[PD_DEBUG][NUM_BLOCKS_MISMATCH] dp_ranks have "
+                    "different num_blocks! min=%d max=%d. "
+                    "Remapped slots MAY exceed global cache!",
+                    _num_blocks_min, _num_blocks_max)
+
         # ---- Step 0: per-dp_rank unpad (slide per-req fields down
         # to actual sizes via ``cm.unpadded``).
         cms_unpadded: list[AscendCommonAttentionMetadata] = []
@@ -2081,6 +2102,10 @@ class BatchedModelRunner(NPUModelRunner):
 
                 # Per-gid slot_mapping.
                 parts_sm = []
+                _global_num_blocks = getattr(self, "_global_num_blocks", None)
+                _global_cache_slots = (
+                    _global_num_blocks * bs
+                    if _global_num_blocks is not None else None)
                 for cm_unpadded, b, k in zip(
                         cms_unpadded, bundles, batched_dp_ranks):
                     if kv_cache_gid == 0:
@@ -2095,8 +2120,53 @@ class BatchedModelRunner(NPUModelRunner):
                         ((local // bs) * dp_size
                          + per_dp_offsets[k]) * bs
                         + (local % bs))
+                    # Debug 2: per-rank slot_mapping info.
+                    _local_max = local[local != PAD_SLOT_ID].max().item() if local.numel() > 0 and (local != PAD_SLOT_ID).any() else -1
+                    _remapped_max = remapped[remapped != PAD_SLOT_ID].max().item() if remapped.numel() > 0 and (remapped != PAD_SLOT_ID).any() else -1
+                    _remapped_min = remapped[remapped != PAD_SLOT_ID].min().item() if remapped.numel() > 0 and (remapped != PAD_SLOT_ID).any() else -1
+                    _per_nb = self._per_dp_num_blocks.get(k, -1) if hasattr(self, "_per_dp_num_blocks") else -1
+                    _per_max_slot = _per_nb * bs - 1 if _per_nb > 0 else -1
+                    _per_off = self._per_dp_offsets.get(k, -1) if hasattr(self, "_per_dp_offsets") else -1
+                    logger.info(
+                        "[PD_DEBUG][SLOT_REMAP] kv_gid=%d dp_rank=%d "
+                        "num_tokens=%d per_dp_num_blocks=%d per_dp_offset=%d "
+                        "local_max=%d remapped_range=[%d,%d] "
+                        "per_dp_cache_max_slot=%d global_cache_slots=%s",
+                        kv_cache_gid, k, n, _per_nb, _per_off,
+                        _local_max, _remapped_min, _remapped_max,
+                        _per_max_slot, _global_cache_slots)
                     parts_sm.append(remapped)
                 merged_slot_mapping = torch.cat(parts_sm, dim=0)
+
+                # Debug 3: validate remapped slots within global KV cache bounds.
+                _valid_mask = merged_slot_mapping != PAD_SLOT_ID
+                if _valid_mask.any():
+                    _merged_max = merged_slot_mapping[_valid_mask].max().item()
+                    _merged_min = merged_slot_mapping[_valid_mask].min().item()
+                    _global_num_blocks_v = getattr(self, "_global_num_blocks", None)
+                    _cache_limit = _global_num_blocks_v * bs if _global_num_blocks_v else None
+                    _oob = _cache_limit is not None and _merged_max >= _cache_limit
+                    logger.info(
+                        "[PD_DEBUG][SLOT_VALIDATE] kv_gid=%d "
+                        "merged_slot_range=[%d,%d] "
+                        "global_cache_slots=%d "
+                        "OOB=%s (max>=cache_limit=%s)",
+                        kv_cache_gid, _merged_min, _merged_max,
+                        _cache_limit,
+                        "YES!!!" if _oob else "OK",
+                        f"{_merged_max} >= {_cache_limit}" if _cache_limit else "N/A")
+                    if _oob:
+                        _oob_count = (merged_slot_mapping[_valid_mask] >= _cache_limit).sum().item()
+                        logger.error(
+                            "[PD_DEBUG][SLOT_OOB] %d remapped slots exceed "
+                            "global KV cache (max_slot=%d >= cache_limit=%d)! "
+                            "kv_gid=%d dp_ranks=%s",
+                            _oob_count, _merged_max, _cache_limit,
+                            kv_cache_gid, batched_dp_ranks)
+                else:
+                    logger.info(
+                        "[PD_DEBUG][SLOT_VALIDATE] kv_gid=%d all slots are PAD_SLOT_ID (-1)", kv_cache_gid)
+
                 if (merged_slot_mapping.shape[0]
                         < merged_num_tokens_padded):
                     pad = torch.full(
