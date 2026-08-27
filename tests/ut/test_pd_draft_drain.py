@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+﻿# SPDX-License-Identifier: Apache-2.0
 """Unit tests for the DRAFT_FIRST -> DRAFT_LAST alternation invariant and the
 drain path that pairs the cloud's DRAFT_LAST response when the owning request
 finishes or is aborted mid-chain.
@@ -68,7 +68,7 @@ def _make_bare_scheduler():
 
 def _make_draft_first(task_id="task-0", req_id="req-0", step=0):
     so = MagicMock()
-    so.batch_type = BatchType.DRAFT_FIRST
+    so.batch_type = BatchType.PREFILL_DRAFT_FIRST
     so.draft_task_id = task_id
     so.draft_step_idx = step
     so.head_token = f"tok-{task_id}-{step}"
@@ -84,7 +84,7 @@ def _make_draft_first(task_id="task-0", req_id="req-0", step=0):
 
 def _make_draft_last(task_id="task-0", req_id="req-0", step=0):
     so = MagicMock()
-    so.batch_type = BatchType.DRAFT_LAST
+    so.batch_type = BatchType.PREFILL_DRAFT_LAST
     so.draft_task_id = task_id
     so.draft_step_idx = step
     so.head_token = f"tok-{task_id}-{step}"
@@ -110,7 +110,7 @@ def _make_real_output(
 
 
 # ------------------------------------------------------------------ #
-# Test: _can_schedule_draft_first honors _force_draft_last (fix ①)   #
+# Test: _can_schedule_draft_first honors _force_draft_last (fix 鈶?   #
 # ------------------------------------------------------------------ #
 
 
@@ -333,7 +333,7 @@ class TestMidPrefillDraftChain:
 
         engine = MagicMock()
         engine.use_spec_decode = True
-        finalized = _make_real_output(BatchType.DRAFT_FIRST)
+        finalized = _make_real_output(BatchType.PREFILL_DRAFT_FIRST)
         engine.scheduler.finalize_pre_generated_draft_first.return_value = (
             finalized
         )
@@ -396,7 +396,7 @@ class TestMidPrefillDraftChain:
 
 
 # ------------------------------------------------------------------ #
-# Test: _draft_output_reqs_live / _is_stale_draft_output (fix ②d)    #
+# Test: _draft_output_reqs_live / _is_stale_draft_output (fix 鈶)    #
 # ------------------------------------------------------------------ #
 
 
@@ -437,7 +437,7 @@ class TestDraftReqsLiveAndStale:
 
 
 # ------------------------------------------------------------------ #
-# Test: _pick_draft_last_batch drains instead of dropping (fix ②a)   #
+# Test: _pick_draft_last_batch drains instead of dropping (fix 鈶)   #
 # ------------------------------------------------------------------ #
 
 
@@ -467,7 +467,7 @@ class TestPickDraftLastBatchDrain:
 
         # The tail is returned (dispatched to the worker for drain), not
         # dropped -- the cloud's response must be paired on the DECODE channel.
-        assert result.batch_type == BatchType.DRAFT_LAST
+        assert result.batch_type == BatchType.PREFILL_DRAFT_LAST
         assert len(s.drafts_last_ready) == 0
         # _force_draft_last is always reset now (the old stale-drop skipped it).
         assert s._force_draft_last is False
@@ -481,7 +481,7 @@ class TestPickDraftLastBatchDrain:
     def test_live_request_prepares_placeholder(self):
         s = self._setup(req_present=True)
         result = s._pick_draft_last_batch()
-        assert result.batch_type == BatchType.DRAFT_LAST
+        assert result.batch_type == BatchType.PREFILL_DRAFT_LAST
         assert s._force_draft_last is False
         s._prepare_next_decode_first_placeholder.assert_called_once()
 
@@ -493,7 +493,7 @@ class TestPickDraftLastBatchDrain:
 
 
 # ------------------------------------------------------------------ #
-# Test: worker _run_edge_cloud_draft_last_segment drain (fix ②c)    #
+# Test: worker _run_edge_cloud_draft_last_segment drain (fix 鈶)    #
 # ------------------------------------------------------------------ #
 
 

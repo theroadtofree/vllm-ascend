@@ -231,7 +231,10 @@ def _drain_pd_channel_inbox(self) -> None:
             self.scheduler.prefills_last_ready.append(so)
         elif bt == BatchType.DECODE_LAST:
             self.scheduler.decodes_last_ready.append(so)
-        elif bt == BatchType.DRAFT_LAST:
+        elif bt in (
+            BatchType.PREFILL_DRAFT_LAST,
+            BatchType.DECODE_DRAFT_LAST,
+        ):
             # DRAFT_LAST is self-posted by _pick_draft_first_batch (like
             # DECODE_LAST). If it arrives via POST_OUT (e.g. from an older
             # cloud that still publishes it), drop it -- the edge already has
@@ -344,7 +347,11 @@ def _post_irecv_hints_for_first_batch(
     num_reqs = len(scheduler_output.num_scheduled_tokens)
     for step_idx in range(num_spec):
         post_irecv_hint({
-            "batch_type": BatchType.DRAFT_LAST,
+            "batch_type": (
+                BatchType.PREFILL_DRAFT_LAST
+                if prefill_phase
+                else BatchType.DECODE_DRAFT_LAST
+            ),
             "draft_prefill_phase": prefill_phase,
             "seqno": base + step_idx,
             "num_tokens": total_tokens if step_idx == 0 else num_reqs,
@@ -383,7 +390,10 @@ def _maybe_publish_pre_out(
     if getattr(self, "_pp_pd_channel", None) is None:
         return
     bt = scheduler_output.batch_type
-    if bt == BatchType.DRAFT_FIRST:
+    if bt in (
+        BatchType.PREFILL_DRAFT_FIRST,
+        BatchType.DECODE_DRAFT_FIRST,
+    ):
         if scheduler_output.draft_chain_dead:
             # Dead chains never wait for scalar patching (their parent
             # produces none): publish immediately so the cloud runs the
@@ -428,7 +438,8 @@ def _maybe_publish_pre_out(
         BatchType.EMPTY,
         BatchType.PREFILL_LAST,
         BatchType.DECODE_LAST,
-        BatchType.DRAFT_LAST,
+        BatchType.PREFILL_DRAFT_LAST,
+        BatchType.DECODE_DRAFT_LAST,
     ):
         return
     else:
@@ -480,7 +491,8 @@ def _ensure_pd_head_token(self, scheduler_output: SchedulerOutput) -> None:
     if scheduler_output.batch_type not in (
         BatchType.PREFILL_FIRST,
         BatchType.DECODE_FIRST,
-        BatchType.DRAFT_FIRST,
+        BatchType.PREFILL_DRAFT_FIRST,
+        BatchType.DECODE_DRAFT_FIRST,
     ):
         return
     if not scheduler_output.head_token:
@@ -675,7 +687,10 @@ def _advance_edge_cloud_draft(
         )
         return
 
-    if batch_type != BatchType.DRAFT_LAST:
+    if batch_type not in (
+        BatchType.PREFILL_DRAFT_LAST,
+        BatchType.DECODE_DRAFT_LAST,
+    ):
         return
     draft_step_idx = int(completed_scheduler_output.draft_step_idx or 0)
     if draft_step_idx + 1 >= getattr(
@@ -994,7 +1009,10 @@ def _patched_step_with_batch_queue(self):
         # [ascend insert] Publish head-segment batches immediately at
         # schedule time to keep the pipeline full.
         if scheduler_output.batch_type in (
-            BatchType.PREFILL_FIRST, BatchType.DECODE_FIRST, BatchType.DRAFT_FIRST
+            BatchType.PREFILL_FIRST,
+            BatchType.DECODE_FIRST,
+            BatchType.PREFILL_DRAFT_FIRST,
+            BatchType.DECODE_DRAFT_FIRST,
         ):
             self._maybe_publish_pre_out(scheduler_output)
 

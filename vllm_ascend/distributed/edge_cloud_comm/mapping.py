@@ -27,22 +27,50 @@ from vllm_ascend.distributed.edge_cloud_comm.types import (
 )
 
 _FIRST_BATCHES = frozenset(
-    {BatchType.PREFILL_FIRST, BatchType.DECODE_FIRST, BatchType.DRAFT_FIRST}
+    {
+        BatchType.PREFILL_FIRST,
+        BatchType.DECODE_FIRST,
+        BatchType.PREFILL_DRAFT_FIRST,
+        BatchType.DECODE_DRAFT_FIRST,
+    }
 )
 _LAST_BATCHES = frozenset(
-    {BatchType.PREFILL_LAST, BatchType.DECODE_LAST, BatchType.DRAFT_LAST}
+    {
+        BatchType.PREFILL_LAST,
+        BatchType.DECODE_LAST,
+        BatchType.PREFILL_DRAFT_LAST,
+        BatchType.DECODE_DRAFT_LAST,
+    }
 )
-_DRAFT_BATCHES = frozenset({BatchType.DRAFT_FIRST, BatchType.DRAFT_LAST})
+_DRAFT_BATCHES = frozenset(
+    {
+        BatchType.PREFILL_DRAFT_FIRST,
+        BatchType.PREFILL_DRAFT_LAST,
+        BatchType.DECODE_DRAFT_FIRST,
+        BatchType.DECODE_DRAFT_LAST,
+    }
+)
+_PREFILL_DRAFT_BATCHES = frozenset(
+    {BatchType.PREFILL_DRAFT_FIRST, BatchType.PREFILL_DRAFT_LAST}
+)
 
 
-def kind_for_batch_type(
-    batch_type: BatchType, *, prefill_phase_draft: bool = False
-) -> BatchKind:
+def is_draft_batch_type(batch_type: BatchType) -> bool:
+    """True for any scheduled draft batch (prefill- or decode-phase)."""
+    return batch_type in _DRAFT_BATCHES
+
+
+def is_prefill_phase_draft(batch_type: BatchType) -> bool:
+    """True when a scheduled draft batch belongs to a prefill-phase chain."""
+    return batch_type in _PREFILL_DRAFT_BATCHES
+
+
+def kind_for_batch_type(batch_type: BatchType) -> BatchKind:
     """Business kind of a batch.
 
-    ``prefill_phase_draft`` distinguishes the prefill-stage scheduled draft
-    (PREFILL_DRAFT pair) from the decode-stage draft (DECODE pair, shared
-    with plain decode — the two never co-exist in flight).
+    The phase of a scheduled draft is encoded in the batch type itself
+    (PREFILL_DRAFT_* -> PREFILL_DRAFT pair, DECODE_DRAFT_* -> DECODE pair
+    shared with plain decode — the two never co-exist in flight).
     """
     if batch_type in (BatchType.PREFILL_FIRST, BatchType.PREFILL_LAST):
         return BatchKind.PREFILL
@@ -51,7 +79,7 @@ def kind_for_batch_type(
     if batch_type in _DRAFT_BATCHES:
         return (
             BatchKind.PREFILL_DRAFT
-            if prefill_phase_draft
+            if batch_type in _PREFILL_DRAFT_BATCHES
             else BatchKind.DECODE_DRAFT
         )
     raise RuntimeError(f"No BatchKind for batch_type={batch_type}")
@@ -78,8 +106,6 @@ def channel_for_direction(kind: BatchKind, up: bool) -> CommChannelType:
 def channel_for(
     batch_type: BatchType,
     kind: BatchKind | None = None,
-    *,
-    prefill_phase_draft: bool = False,
 ) -> CommChannelType:
     """Logical six-channel mapping for a batch.
 
@@ -87,9 +113,7 @@ def channel_for(
     batch type (FIRST = up, LAST = down), not in the device role.
     """
     if kind is None:
-        kind = kind_for_batch_type(
-            batch_type, prefill_phase_draft=prefill_phase_draft
-        )
+        kind = kind_for_batch_type(batch_type)
     if batch_type in _FIRST_BATCHES:
         up = True
     elif batch_type in _LAST_BATCHES:

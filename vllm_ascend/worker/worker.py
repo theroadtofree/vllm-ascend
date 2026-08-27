@@ -1021,17 +1021,19 @@ class NPUWorker(WorkerBase):
                 },
             )
             return
-        prefill_phase_draft = bool(hint.get("draft_prefill_phase", False))
-        kind = kind_for_batch_type(
-            batch_type, prefill_phase_draft=prefill_phase_draft
-        )
+        kind = kind_for_batch_type(batch_type)
         channel = channel_for(batch_type, kind)
         draft_meta = None
         sp_chunk = False
         if kind in (BatchKind.PREFILL_DRAFT, BatchKind.DECODE_DRAFT):
             # Draft wire derives its schema from the scheduled-draft meta;
             # FIRST travels edge->cloud, LAST cloud->edge.
-            direction = "e2c" if batch_type == BatchType.DRAFT_FIRST else "c2e"
+            direction = (
+                "e2c"
+                if batch_type
+                in (BatchType.PREFILL_DRAFT_FIRST, BatchType.DECODE_DRAFT_FIRST)
+                else "c2e"
+            )
             draft_meta = self._build_draft_tensor_meta(
                 direction,
                 int(hint.get("draft_step_idx") or 0),
@@ -1206,14 +1208,23 @@ class NPUWorker(WorkerBase):
         if self.model_runner._edge_cloud_enabled:
             bt = scheduler_output.batch_type
             if is_cloud_device():
-                if bt == BatchType.DRAFT_FIRST:
+                if bt in (
+                    BatchType.PREFILL_DRAFT_FIRST,
+                    BatchType.DECODE_DRAFT_FIRST,
+                ):
                     return self._execute_model_cloud_draft(scheduler_output)
                 return self._execute_model_cloud(
                     scheduler_output, layer_slice_info
                 )
-            if bt == BatchType.DRAFT_FIRST:
+            if bt in (
+                BatchType.PREFILL_DRAFT_FIRST,
+                BatchType.DECODE_DRAFT_FIRST,
+            ):
                 return self._execute_model_edge_draft_head(scheduler_output)
-            if bt == BatchType.DRAFT_LAST:
+            if bt in (
+                BatchType.PREFILL_DRAFT_LAST,
+                BatchType.DECODE_DRAFT_LAST,
+            ):
                 return self._execute_model_edge_draft_tail(scheduler_output)
             if bt in (BatchType.PREFILL_FIRST, BatchType.DECODE_FIRST):
                 return self._execute_model_edge_head(
@@ -1617,10 +1628,7 @@ class NPUWorker(WorkerBase):
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
         # Prefill-phase draft chains travel on the PREFILL_DRAFT channel
         # pair, decode-phase chains on the DECODE pair.
-        _kind = kind_for_batch_type(
-            scheduler_output.batch_type,
-            prefill_phase_draft=scheduler_output.draft_prefill_phase,
-        )
+        _kind = kind_for_batch_type(scheduler_output.batch_type)
         _seqno = self._require_comm_seqno(scheduler_output)
         recv_tensor_meta = self._scheduled_draft_tensor_meta(
             scheduler_output,
@@ -1793,10 +1801,7 @@ class NPUWorker(WorkerBase):
             )
             # Prefill-phase draft chains travel on the PREFILL_DRAFT
             # channel pair, decode-phase chains on the DECODE pair.
-            _kind = kind_for_batch_type(
-                scheduler_output.batch_type,
-                prefill_phase_draft=scheduler_output.draft_prefill_phase,
-            )
+            _kind = kind_for_batch_type(scheduler_output.batch_type)
             get_comm_service().submit_send(
                 CommRequest(
                     channel=channel_for(scheduler_output.batch_type, _kind),
@@ -1841,10 +1846,7 @@ class NPUWorker(WorkerBase):
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
         # Prefill-phase draft chains travel on the PREFILL_DRAFT channel
         # pair, decode-phase chains on the DECODE pair.
-        _kind = kind_for_batch_type(
-            scheduler_output.batch_type,
-            prefill_phase_draft=scheduler_output.draft_prefill_phase,
-        )
+        _kind = kind_for_batch_type(scheduler_output.batch_type)
         recv_tensor_meta = self._scheduled_draft_tensor_meta(
             scheduler_output,
             "c2e",

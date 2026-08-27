@@ -318,15 +318,23 @@ class PassiveScheduler:
                     )
                 self._last_decode_first_arrival_ts = now
                 self.ready_decodes.append(scheduler_output)
-            elif bt == BatchType.DRAFT_FIRST:
-                if getattr(scheduler_output, "draft_prefill_phase", False):
+            elif bt in (
+                BatchType.PREFILL_DRAFT_FIRST,
+                BatchType.DECODE_DRAFT_FIRST,
+            ):
+                # The draft chain phase is encoded in the batch type itself:
+                # prefill-phase chains route to ready_prefill_drafts
+                # (PREFILL_DRAFT pair), decode-phase chains to
+                # ready_decode_drafts (DECODE pair).
+                if bt == BatchType.PREFILL_DRAFT_FIRST:
                     self.ready_prefill_drafts.append(scheduler_output)
                 else:
                     self.ready_decode_drafts.append(scheduler_output)
             elif bt in (
                 BatchType.PREFILL_LAST,
                 BatchType.DECODE_LAST,
-                BatchType.DRAFT_LAST,
+                BatchType.PREFILL_DRAFT_LAST,
+                BatchType.DECODE_DRAFT_LAST,
             ):
                 # Tail-segment batches are edge-only and must never be
                 # dispatched on the cloud. If one shows up here it is a
@@ -525,7 +533,8 @@ class PassiveScheduler:
         if so.batch_type in (
             BatchType.PURE_DECODE,
             BatchType.DECODE_FIRST,
-            BatchType.DRAFT_FIRST,
+            BatchType.PREFILL_DRAFT_FIRST,
+            BatchType.DECODE_DRAFT_FIRST,
         ):
             return [None]
 

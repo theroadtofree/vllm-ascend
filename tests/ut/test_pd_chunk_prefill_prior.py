@@ -1,12 +1,12 @@
-# SPDX-License-Identifier: Apache-2.0
+﻿# SPDX-License-Identifier: Apache-2.0
 """Unit tests for chunk-prefill-prior scheduling in PDSeparatedScheduler.
 
 Tests cover:
-  - Config wiring (ascend_config → platform → scheduler_config)
+  - Config wiring (ascend_config 鈫?platform 鈫?scheduler_config)
   - PrefillChunkFlight creation and lifecycle
   - Ahead scheduling (next chunk PF before previous PL)
   - PL routing by head_token
-  - Last-chunk → decode transition
+  - Last-chunk 鈫?decode transition
   - Backward compatibility (chunk_prefill_prior_enable=False)
   - Request cleanup (finish / abort)
   - _migrate_prefill_to_running guard
@@ -92,7 +92,7 @@ def _make_vllm_config_for_scheduler(
 
 
 class TestConfigWiring:
-    """Verify ascend_config → platform → scheduler_config propagation."""
+    """Verify ascend_config 鈫?platform 鈫?scheduler_config propagation."""
 
     def test_chunk_prefill_prior_enabled_wires_to_scheduler_config(self):
         """When chunk_prefill_prior_enable=True, it lands on scheduler_config."""
@@ -236,7 +236,7 @@ class TestCrossRequestHeadPrior:
 
     Multi-request path: when next_prefill_prior_enable is on and another
     request can fill the slot, yield (do NOT ahead) so the next slot
-    dispatches the other request's head (cross-request P1首 -> P2首).
+    dispatches the other request's head (cross-request P1棣?-> P2棣?.
     """
 
     def _make_scheduler(self, *, next_prior=False, ahead_limit=1):
@@ -960,7 +960,7 @@ class TestBackwardCompatibility:
         scheduler.decode_or_draft_inflight_count = 0
         scheduler.decode_or_draft_inflight_limit = 1
 
-        # Should not raise — log format uses legacy fields.
+        # Should not raise 鈥?log format uses legacy fields.
         scheduler._log_scheduler_state(PrefillState.IDLE, BatchType.PREFILL_FIRST)
         assert scheduler._step_counter == 1
 
@@ -1123,7 +1123,7 @@ class TestPDPreemptionProtection:
         for step in (0, 1):
             scheduler._register_pd_flight(
                 self._make_output(
-                    BatchType.DRAFT_FIRST,
+                    BatchType.PREFILL_DRAFT_FIRST,
                     draft_task_id="draft-0",
                     draft_step_idx=step,
                 )
@@ -1132,7 +1132,7 @@ class TestPDPreemptionProtection:
         assert scheduler._pd_active_flight_count == {"req-0": 2}
         scheduler._complete_pd_flight(
             self._make_output(
-                BatchType.DRAFT_LAST,
+                BatchType.PREFILL_DRAFT_LAST,
                 draft_task_id="draft-0",
                 draft_step_idx=0,
             )
@@ -1140,7 +1140,7 @@ class TestPDPreemptionProtection:
         assert scheduler._pd_active_flight_count == {"req-0": 1}
         scheduler._complete_pd_flight(
             self._make_output(
-                BatchType.DRAFT_LAST,
+                BatchType.PREFILL_DRAFT_LAST,
                 draft_task_id="draft-0",
                 draft_step_idx=1,
             )

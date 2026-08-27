@@ -158,8 +158,10 @@ class PPSchedulerZmqPublisher:
         {
             BatchType.DECODE_FIRST,
             BatchType.DECODE_LAST,
-            BatchType.DRAFT_FIRST,
-            BatchType.DRAFT_LAST,
+            BatchType.PREFILL_DRAFT_FIRST,
+            BatchType.PREFILL_DRAFT_LAST,
+            BatchType.DECODE_DRAFT_FIRST,
+            BatchType.DECODE_DRAFT_LAST,
         }
     )
 
@@ -564,7 +566,11 @@ def _updates_worker_persistent_batch(
 ) -> bool:
     """Return whether this dispatch updates the cloud worker batch state."""
     return (
-        scheduler_output.batch_type != BatchType.DRAFT_FIRST
+        scheduler_output.batch_type
+        not in (
+            BatchType.PREFILL_DRAFT_FIRST,
+            BatchType.DECODE_DRAFT_FIRST,
+        )
         and scheduler_output.total_num_scheduled_tokens > 0
         and (slice_info is None or slice_info.is_first_slice)
     )
@@ -764,7 +770,11 @@ class PassiveEngineCoreProc:
             num_reqs = len(so.num_scheduled_tokens)
             for step_idx in range(num_spec):
                 post_irecv_hint({
-                    "batch_type": BatchType.DRAFT_FIRST,
+                    "batch_type": (
+                        BatchType.PREFILL_DRAFT_FIRST
+                        if prefill_phase
+                        else BatchType.DECODE_DRAFT_FIRST
+                    ),
                     "draft_prefill_phase": prefill_phase,
                     "seqno": base + step_idx,
                     "num_tokens": (
@@ -945,7 +955,10 @@ class PassiveEngineCoreProc:
                 scheduler_output.head_token,
             )
             return
-        elif bt == BatchType.DRAFT_FIRST:
+        elif bt in (
+            BatchType.PREFILL_DRAFT_FIRST,
+            BatchType.DECODE_DRAFT_FIRST,
+        ):
             # The edge pre-generates DRAFT_LAST (self-posting, same as
             # DECODE_FIRST -> DECODE_LAST), so the cloud does not publish
             # POST_OUT for DRAFT_FIRST.

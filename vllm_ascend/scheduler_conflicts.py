@@ -33,8 +33,10 @@ def _vllm_pd_scheduler_schema_available() -> bool:
         "PREFILL_LAST",
         "DECODE_FIRST",
         "DECODE_LAST",
-        "DRAFT_FIRST",
-        "DRAFT_LAST",
+        "PREFILL_DRAFT_FIRST",
+        "PREFILL_DRAFT_LAST",
+        "DECODE_DRAFT_FIRST",
+        "DECODE_DRAFT_LAST",
     )
     if any(not hasattr(BatchType, name) for name in required_batch_types):
         return False

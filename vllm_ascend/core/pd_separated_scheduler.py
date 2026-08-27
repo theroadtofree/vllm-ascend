@@ -81,9 +81,22 @@ class PDActiveFlight:
 _PD_FIRST_TO_LAST = {
     BatchType.PREFILL_FIRST: BatchType.PREFILL_LAST,
     BatchType.DECODE_FIRST: BatchType.DECODE_LAST,
-    BatchType.DRAFT_FIRST: BatchType.DRAFT_LAST,
+    BatchType.PREFILL_DRAFT_FIRST: BatchType.PREFILL_DRAFT_LAST,
+    BatchType.DECODE_DRAFT_FIRST: BatchType.DECODE_DRAFT_LAST,
 }
 _PD_LAST_TO_FIRST = {last: first for first, last in _PD_FIRST_TO_LAST.items()}
+
+# Scheduled-draft batch types, split by chain phase: prefill-phase chains
+# travel on the dedicated PREFILL_DRAFT pair, decode-phase chains on the
+# DECODE pair (shared with plain decode).
+_DRAFT_FIRST_TYPES = (
+    BatchType.PREFILL_DRAFT_FIRST,
+    BatchType.DECODE_DRAFT_FIRST,
+)
+_DRAFT_LAST_TYPES = (
+    BatchType.PREFILL_DRAFT_LAST,
+    BatchType.DECODE_DRAFT_LAST,
+)
 
 
 # Default cap on concurrent PF→PL round trips (2P pipelining).  This is a
@@ -445,8 +458,7 @@ class PDSeparatedScheduler(Scheduler):
             in (
                 BatchType.PREFILL_FIRST,
                 BatchType.DECODE_FIRST,
-                BatchType.DRAFT_FIRST,
-            )
+            ) + _DRAFT_FIRST_TYPES
         ):
             scheduler_output.cloud_draft_invalidate_task_ids = (
                 self._pending_cloud_draft_invalidations
@@ -651,7 +663,7 @@ class PDSeparatedScheduler(Scheduler):
         scheduler_output: SchedulerOutput,
         first_batch_type: BatchType,
     ) -> tuple[BatchType, str]:
-        if first_batch_type == BatchType.DRAFT_FIRST:
+        if first_batch_type in _DRAFT_FIRST_TYPES:
             draft_task_id = scheduler_output.draft_task_id
             if not draft_task_id:
                 raise RuntimeError("DRAFT flight is missing draft_task_id")
@@ -802,8 +814,7 @@ class PDSeparatedScheduler(Scheduler):
         is_tail = scheduler_output.batch_type in (
             BatchType.PREFILL_LAST,
             BatchType.DECODE_LAST,
-            BatchType.DRAFT_LAST,
-        )
+        ) + _DRAFT_LAST_TYPES
         if has_work or is_tail:
             self._log_scheduler_state(state, scheduler_output.batch_type)
         else:
@@ -1793,7 +1804,11 @@ class PDSeparatedScheduler(Scheduler):
                 self._draft_publish_pending.pop(task_id, None)
                 self._draft_publish_scalars_patched.discard(task_id)
 
-        scheduler_output.batch_type = BatchType.DRAFT_FIRST
+        scheduler_output.batch_type = (
+            BatchType.PREFILL_DRAFT_FIRST
+            if prefill_phase
+            else BatchType.DECODE_DRAFT_FIRST
+        )
         if scheduler_output.head_token is None:
             scheduler_output.head_token = uuid4().hex
         # Dead-chain drain: every remaining step of a chain whose requests
@@ -1830,7 +1845,11 @@ class PDSeparatedScheduler(Scheduler):
         # preserves DRAFT_FIRST -> DRAFT_LAST data-plane ordering.
         draft_last = replace(
             scheduler_output,
-            batch_type=BatchType.DRAFT_LAST,
+            batch_type=(
+                BatchType.PREFILL_DRAFT_LAST
+                if prefill_phase
+                else BatchType.DECODE_DRAFT_LAST
+            ),
             num_accepted_tokens=None,
             valid_sampled_token_count=None,
         )
@@ -1981,7 +2000,11 @@ class PDSeparatedScheduler(Scheduler):
         for step_idx in range(self.num_spec_tokens):
             draft_first = replace(
                 target_tail,
-                batch_type=BatchType.DRAFT_FIRST,
+                batch_type=(
+                    BatchType.PREFILL_DRAFT_FIRST
+                    if prefill_phase
+                    else BatchType.DECODE_DRAFT_FIRST
+                ),
                 head_token=None,
                 parent_req_id=req_ids[0],
                 draft_task_id=task_id,
@@ -2099,7 +2122,15 @@ class PDSeparatedScheduler(Scheduler):
 
         draft_first = replace(
             source,
-            batch_type=BatchType.DRAFT_FIRST,
+            batch_type=(
+                BatchType.PREFILL_DRAFT_FIRST
+                if (
+                    source.draft_prefill_phase
+                    if source.batch_type in _DRAFT_LAST_TYPES
+                    else source.batch_type == BatchType.PREFILL_LAST
+                )
+                else BatchType.DECODE_DRAFT_FIRST
+            ),
             head_token=None,
             parent_req_id=req_ids[0],
             draft_task_id=draft_task_id,
@@ -2108,7 +2139,7 @@ class PDSeparatedScheduler(Scheduler):
             # DRAFT_LAST; chain starts derive it from the parent tail.
             draft_prefill_phase=(
                 source.draft_prefill_phase
-                if source.batch_type == BatchType.DRAFT_LAST
+                if source.batch_type in _DRAFT_LAST_TYPES
                 else source.batch_type == BatchType.PREFILL_LAST
             ),
             draft_chain_dead=chain_dead,
@@ -2182,7 +2213,7 @@ class PDSeparatedScheduler(Scheduler):
         )
         while last_ready:
             scheduler_output = last_ready.popleft()
-            if scheduler_output.batch_type != BatchType.DRAFT_LAST:
+            if scheduler_output.batch_type not in _DRAFT_LAST_TYPES:
                 raise RuntimeError(
                     "drafts_last_ready expects DRAFT_LAST, got "
                     f"{scheduler_output.batch_type}"
@@ -3054,7 +3085,7 @@ class PDSeparatedScheduler(Scheduler):
                 f"[PD] update_from_output DECODE_FIRST done, "
                 f"decode_or_draft_inflight: {self.decode_or_draft_inflight_count}/{self.decode_or_draft_inflight_limit}",
             )
-        if scheduler_output.batch_type == BatchType.DRAFT_FIRST:
+        if scheduler_output.batch_type in _DRAFT_FIRST_TYPES:
             # Only decode-phase drafts claim the decode-lane in-flight
             # counter at pick time; prefill-phase drafts never touch it.
             if not scheduler_output.draft_prefill_phase:
@@ -3069,7 +3100,7 @@ class PDSeparatedScheduler(Scheduler):
                 self.decode_or_draft_inflight_limit,
             )
         enqueue_next_draft = (
-            scheduler_output.batch_type == BatchType.DRAFT_LAST
+            scheduler_output.batch_type in _DRAFT_LAST_TYPES
         )
         if enqueue_next_draft:
             if scheduler_output.draft_prefill_phase:

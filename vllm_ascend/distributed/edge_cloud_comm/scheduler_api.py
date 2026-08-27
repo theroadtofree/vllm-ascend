@@ -61,14 +61,11 @@ def build_recv_request(
     sp_chunk: bool = False,
     include_mrope: bool = True,
     src_dst: int | None = None,
-    prefill_phase_draft: bool = False,
 ) -> CommRequest:
     """Canonical recv-request builder (same-process schedulers and the
     worker's own consume points share this so field assembly never drifts).
     """
-    kind = kind_for_batch_type(
-        batch_type, prefill_phase_draft=prefill_phase_draft
-    )
+    kind = kind_for_batch_type(batch_type)
     return CommRequest(
         channel=channel_for(batch_type, kind),
         op="recv",
