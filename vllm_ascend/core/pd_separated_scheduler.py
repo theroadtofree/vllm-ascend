@@ -200,6 +200,12 @@ class PDSeparatedScheduler(Scheduler):
         # soon as the parent is published; DRF steps consume
         # base + draft_step_idx at pick time.
         self._reserved_draft_seqno_base: dict[str, int] = {}
+        # [B] prefill_draft_up 通道已派发 DRAFT_FIRST 的最高连续 seqno。
+        # 派发 gate：候选 F 的 seqno 必须 <= 该值（缺口未补齐不派发），
+        # 保证通道 seqno 连续，防止 reorder buffer（held）死锁——动态链
+        # 的 step1/2 未生成时，预生成链 step0（seqno 更大）抢发会被通道
+        # 持有，永不发布，云侧 recv 永等。
+        self._prefill_draft_up_next_expected: int = 0
 
         # Buffer queue: requests whose P-first segment is done but P-last
         # segment has not yet returned from the cloud.  Not eligible for
@@ -1226,12 +1232,26 @@ class PDSeparatedScheduler(Scheduler):
             )
         )
 
-    def _can_schedule_prefill_draft_first(self) -> bool:
-        if not self.prefill_drafts_first_ready:
-            return False
-        next_output = self.prefill_drafts_first_ready[0]
+    def _prefill_draft_first_seqno_ok(self, so) -> bool:
+        """[B] prefill_draft_up 通道 seqno 连续性检查。
+
+        候选 F 的预期 seqno（预留 base + step_idx）必须 <= 已派发的最高
+        连续 seqno——否则通道上存在缺口（前序链的 step 未派发），此 F
+        提交会被 reorder buffer 持有（held），HCCL send 永不发出，云侧
+        recv 永等。返回 False 的候选跳过（等前序补齐）。
+        """
+        task_id = so.draft_task_id
+        if not task_id:
+            return True
+        base = self._reserved_draft_seqno_base.get(task_id)
+        if base is None:
+            return True  # 无预留 base（异常路径）→ 不检查
+        step_idx = int(getattr(so, "draft_step_idx", 0) or 0)
+        return (base + step_idx) <= self._prefill_draft_up_next_expected
+
+    def _prefill_draft_first_dispatchable(self, so) -> bool:
         is_pregenerated = (
-            next_output.draft_task_id in self._pregenerated_draft_task_ids
+            so.draft_task_id in self._pregenerated_draft_task_ids
         )
         # Prefill-phase chains travel on the dedicated PREFILL_DRAFT channel
         # pair, so no gating on DECODE-stream state (decode_head_inflight /
@@ -1257,6 +1277,20 @@ class PDSeparatedScheduler(Scheduler):
             and not self.prefill_drafts_last_ready
             and not self._force_prefill_draft_last
         )
+
+    def _can_schedule_prefill_draft_first(self) -> bool:
+        if not self.prefill_drafts_first_ready:
+            return False
+        # [B] 扫描整个 ready 队列（非仅队首）：队首可能是被 seqno 缺口
+        # 挡住的预生成链 step0（如 F 15 抢在动态链 step1/2 之前），而
+        # 队列后部的缺口前驱（F 13）可派——必须派它补齐缺口。
+        for candidate in self.prefill_drafts_first_ready:
+            if (
+                self._prefill_draft_first_seqno_ok(candidate)
+                and self._prefill_draft_first_dispatchable(candidate)
+            ):
+                return True
+        return False
 
     def _can_schedule_decode_draft_first(self) -> bool:
         if not self.decode_drafts_first_ready:
@@ -1754,9 +1788,26 @@ class PDSeparatedScheduler(Scheduler):
         else:
             first_ready = self.decode_drafts_first_ready
             last_ready = self.decode_drafts_last_ready
-        while first_ready:
-            scheduler_output = first_ready.popleft()
-            if self._is_stale_draft_output(scheduler_output):
+        # [B] 扫描选择（与 _can_schedule_prefill_draft_first 一致）：
+        # stale 的照常 drain；prefill 候选要求通道 seqno 连续（缺口前驱
+        # 未派发时跳过，如预生成链 step0 抢在动态链 step1/2 之前）——
+        # 派发顺序保证 prefill_draft_up 通道 seqno 连续，防 held 死锁。
+        scheduler_output = None
+        for candidate in first_ready:
+            if self._is_stale_draft_output(candidate):
+                scheduler_output = candidate
+                first_ready.remove(candidate)
+                break
+            if prefill_phase and not self._prefill_draft_first_seqno_ok(
+                candidate
+            ):
+                continue
+            scheduler_output = candidate
+            first_ready.remove(candidate)
+            break
+        if scheduler_output is None:
+            return self._make_empty_batch()
+        if self._is_stale_draft_output(scheduler_output):
                 # Never drop a stale DRAFT_FIRST: its comm seqno was
                 # reserved and its recvs were pre-posted when the parent
                 # batch was published, so dropping it would leave a hole
@@ -1790,9 +1841,6 @@ class PDSeparatedScheduler(Scheduler):
                     scheduler_output.draft_task_id,
                     scheduler_output.draft_step_idx,
                 )
-            break
-        else:
-            return self._make_empty_batch()
 
         task_id = scheduler_output.draft_task_id
         if (
@@ -1827,6 +1875,14 @@ class PDSeparatedScheduler(Scheduler):
         )
         if base is not None:
             scheduler_output.comm_seqno = base + step_idx
+            if prefill_phase:
+                # [B] 更新通道已派发最高连续 seqno（仅连续推进；缺口
+                # 不推进——但派发 gate 已保证派发即连续）。
+                if (
+                    scheduler_output.comm_seqno
+                    == self._prefill_draft_up_next_expected
+                ):
+                    self._prefill_draft_up_next_expected += 1
             if step_idx >= self.num_spec_tokens - 1:
                 self._reserved_draft_seqno_base.pop(task_id, None)
         elif scheduler_output.draft_prefill_phase:
