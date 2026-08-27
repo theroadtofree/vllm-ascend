@@ -874,9 +874,10 @@ class PassiveScheduler:
         # (the edge sends promptly after its DRF head executes), so the
         # DECODE_UP watermark is not consulted here.
         has_decode_draft = bool(self.ready_decode_drafts)
-        has_prefill_draft = bool(self.ready_prefill_drafts) and (
-            not ready_only or self._prefill_draft_head_data_ready()
-        )
+        # Prefill-phase draft heads are hard-gated on the PREFILL_DRAFT_UP
+        # watermark in BOTH passes: the batch is dispatched only after its
+        # payload tensor has been fully received.
+        has_prefill_draft = self._prefill_draft_head_data_ready()
         # (arrival_seq, pick) candidates; the lowest seq wins.  The lambda
         # order breaks the (impossible-in-practice) seq tie deterministically.
         # A missing seq (annotation failed) sorts last, mirroring the old
@@ -932,9 +933,10 @@ class PassiveScheduler:
         # (the edge sends promptly after its DRF head executes), so the
         # DECODE_UP watermark is not consulted here.
         has_decode_draft = bool(self.ready_decode_drafts)
-        has_prefill_draft = bool(self.ready_prefill_drafts) and (
-            not ready_only or self._prefill_draft_head_data_ready()
-        )
+        # Prefill-phase draft heads are hard-gated on the PREFILL_DRAFT_UP
+        # watermark in BOTH passes: the batch is dispatched only after its
+        # payload tensor has been fully received.
+        has_prefill_draft = self._prefill_draft_head_data_ready()
         has_draft = has_decode_draft or has_prefill_draft
         prefill_seq = (
             self._arrival_seq(self.ready_prefills[0])
@@ -1009,17 +1011,21 @@ class PassiveScheduler:
         # — with pre-posted irecvs the recv order was fixed at arrival,
         # so this cannot re-order the channel (see _schedule_by_arrival).
         # The fallback pass (ready_only=False, taken only when nothing
-        # was ready) treats queue non-empty as sufficient: the payload
-        # wait is covered device-side by wait_event, never a host block.
+        # was ready) treats queue non-empty as sufficient for prefill and
+        # decode heads: the payload wait is covered device-side by
+        # wait_event, never a host block.  Prefill-phase drafts stay
+        # watermark-gated in both passes (see has_draft below).
         has_prefill = bool(self.ready_prefills) and (
             not ready_only or self._prefill_head_data_ready()
         )
         has_decode = bool(self.ready_decodes) and (
             not ready_only or self._decode_head_data_ready()
         )
+        # Decode-phase drafts dispatch on arrival; prefill-phase drafts
+        # are hard-gated on the PREFILL_DRAFT_UP watermark in both passes
+        # (dispatched only after the payload tensor is fully received).
         has_draft = bool(self.ready_decode_drafts) or (
-            bool(self.ready_prefill_drafts)
-            and (not ready_only or self._prefill_draft_head_data_ready())
+            self._prefill_draft_head_data_ready()
         )
         if state == CloudSchedulingState.EXPECT_EXECUTE_PREFILL:
             if self._active_prefill_slices:
@@ -1150,9 +1156,10 @@ class PassiveScheduler:
                 return self._pick_decode_batch()
             return ScheduledBatch.empty()
         if queue_name == "ready_prefill_drafts":
-            if self.ready_prefill_drafts and (
-                not ready_only or self._prefill_draft_head_data_ready()
-            ):
+            # Hard-gated on the PREFILL_DRAFT_UP watermark in both passes:
+            # dispatch only after the payload tensor has been fully
+            # received.
+            if self._prefill_draft_head_data_ready():
                 return self._pick_prefill_draft_batch()
             return ScheduledBatch.empty()
         if queue_name == "ready_decode_drafts":
