@@ -1317,7 +1317,7 @@ class NPUModelRunner(GPUModelRunner):
         # DRAFT_FIRST then raises in _reconstruct_cloud_draft_positions and the
         # cloud never sends the DRAFT_LAST response, deadlocking the edge's
         # matching recv on the shared DECODE channel.
-        self._cloud_spec_decode_metadata_cache_max: int = 32
+        self._cloud_spec_decode_metadata_cache_max: int = 10240
         # Same per-task treatment for the verify step's scheduler_output. The
         # independently scheduled draft records request-keyed accepted-token
         # corrections after unrelated work may have replaced the latest
