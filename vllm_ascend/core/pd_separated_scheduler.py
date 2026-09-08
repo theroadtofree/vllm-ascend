@@ -814,7 +814,9 @@ class PDSeparatedScheduler(Scheduler):
             # the original priority order and dispatch anyway — the payload
             # wait happens device-side (wait_event on the pre-posted recv),
             # never a host block.  This keeps single-stream latency off the
-            # report->drain->dispatch confirmation chain.
+            # report->drain->dispatch confirmation chain.  pDRL is exempt:
+            # it stays gated on the PREFILL_DRAFT_DOWN watermark in both
+            # passes (see has_pdrl in _pick_by_state).
             scheduler_output = self._pick_by_state(state, ready_only=False)
         has_work = scheduler_output.total_num_scheduled_tokens > 0
         is_tail = scheduler_output.batch_type in (
@@ -1021,11 +1023,11 @@ class PDSeparatedScheduler(Scheduler):
         # was ready) dispatches the highest-priority pending tail by the
         # original order — its payload wait is covered device-side by
         # wait_event on the pre-posted recv, never a host block.
-        has_pdrl = (
-            self._has_actionable_prefill_draft_tail()
-            if ready_only
-            else bool(self.prefill_drafts_last_ready)
-        )
+        # pDRL is hard-gated on the PREFILL_DRAFT_DOWN watermark in BOTH
+        # passes: the tail is dispatched only after the cloud's response
+        # tensor has been fully received (no device-side wait_event
+        # fallback for it).
+        has_pdrl = self._has_actionable_prefill_draft_tail()
         has_ddrl = (
             self._has_actionable_decode_draft_tail()
             if ready_only
