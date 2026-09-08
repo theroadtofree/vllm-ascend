@@ -616,19 +616,25 @@ class PDSeparatedScheduler(Scheduler):
         the value returned here directly bounds the PF batch size.
         """
         if self.chunk_prefill_prior_enable:
-            exposed, rest_candidates = self._select_pf_candidate_head_prior(
-                saved_chunk_prefill_first
-            )
-            if exposed is not None:
-                # Continue one candidate; cap at 1 so the base does not admit
-                # a new request alongside it (one-per-batch).
-                return [exposed], 1, rest_candidates
-            # No candidate to continue: admit at most one new request from
-            # waiting, gated by system capacity (saved_running occupy their
-            # slots) so we never exceed max_num_running_reqs system-wide.
-            available = saved_max_num_running_reqs - len(saved_running)
-            max_num_running_reqs = 1 if available >= 1 else 0
-            return [], max_num_running_reqs, rest_candidates
+            if self.limit_prefill_batch_size:
+                # Original: force one-per-batch regardless of request size.
+                exposed, rest_candidates = self._select_pf_candidate_head_prior(
+                    saved_chunk_prefill_first
+                )
+                if exposed is not None:
+                    return [exposed], 1, rest_candidates
+                available = saved_max_num_running_reqs - len(saved_running)
+                max_num_running_reqs = 1 if available >= 1 else 0
+                return [], max_num_running_reqs, rest_candidates
+            else:
+                # Decoupled: short requests (single-chunk, is_last=True) can
+                # be freely batched; long requests (multi-chunk) still require
+                # one-per-batch because PrefillChunkFlight tracking keys on
+                # head_token which is batch-level.
+                return self._prepare_pf_running_state_chunk_aware(
+                    saved_chunk_prefill_first, saved_running,
+                    saved_max_num_running_reqs,
+                )
         if self.limit_prefill_batch_size:
             if saved_chunk_prefill_first:
                 return (
@@ -647,6 +653,64 @@ class PDSeparatedScheduler(Scheduler):
             saved_max_num_running_reqs - len(saved_running),
             [],
         )
+
+    def _prepare_pf_running_state_chunk_aware(
+        self,
+        saved_chunk_prefill_first: list[Request],
+        saved_running: list[Request],
+        saved_max_num_running_reqs: int,
+    ) -> tuple[list[Request], int, list[Request]]:
+        """chunk_prior + limit_prefill_batch_size=false: smart batching.
+
+        Short requests (prompt fits in one chunk, is_last will be True) do not
+        need PrefillChunkFlight tracking and can be freely batched together.
+        Long requests (multi-chunk) still require one-per-batch because
+        head_token is batch-level and is_last_prefill_chunk is batch-level.
+
+        Strategy:
+        1. chunk_prefill_first entries are always ahead-schedule continuations
+           of multi-chunk requests → one-per-batch (unchanged).
+        2. When admitting new requests from waiting, check if ALL waiting
+           requests are short. If so, allow multi-request batching (expose
+           full capacity). If any is long, fall back to one-per-batch.
+
+        This never creates a mixed short+long batch, so the batch-level
+        ``is_last_prefill_chunk`` flag remains correct: all-short batches
+        have it True, one-per-long batches have it depending on chunk state.
+        """
+        # chunk_prefill_first: ahead-schedule continuations → always
+        # one-per-batch (same as the original chunk_prior logic).
+        if saved_chunk_prefill_first:
+            exposed, rest_candidates = self._select_pf_candidate_head_prior(
+                saved_chunk_prefill_first
+            )
+            if exposed is not None:
+                return [exposed], 1, rest_candidates
+            available = saved_max_num_running_reqs - len(saved_running)
+            max_num_running_reqs = 1 if available >= 1 else 0
+            return [], max_num_running_reqs, rest_candidates
+
+        # No ahead-schedule continuation. Check if all waiting requests are
+        # short (single-chunk). A request is short if its remaining prompt
+        # tokens fit within max_num_scheduled_tokens — it will complete in
+        # one PF_FIRST step and never need Flight tracking.
+        all_short = True
+        for req in self.waiting:
+            remaining = req.num_prompt_tokens - req.num_computed_tokens
+            if remaining > self.max_num_scheduled_tokens:
+                all_short = False
+                break
+
+        available = saved_max_num_running_reqs - len(saved_running)
+        logger.info(f"all_short = {all_short}, available = {available}")
+        if all_short and available >= 1:
+            # All short: expose full capacity so super().schedule() can
+            # batch multiple short requests within the token budget.
+            return [], available, []
+        else:
+            # Has long request or no capacity: one-per-batch.
+            max_num_running_reqs = 1 if available >= 1 else 0
+            return [], max_num_running_reqs, []
 
     def _total_pending_tails(self) -> int:
         """Total number of chunks waiting for PL across all requests."""
@@ -1473,11 +1537,14 @@ class PDSeparatedScheduler(Scheduler):
 
                     if self.chunk_prefill_prior_enable:
                         # === Chunk-prefill-prior routing ===
-                        # Each scheduled request gets a PerfillChunkFlight.
-                        # If the request still has more chunks after this
-                        # PF, it may be re-added to chunk_prefill_first
-                        # immediately (ahead), allowing the next chunk's PF
-                        # before the current chunk's PL returns.
+                        # Each scheduled request gets a PrefillChunkFlight
+                        # UNLESS it is a short request (is_last=True and
+                        # limit_prefill_batch_size is off): short requests
+                        # don't need Flight tracking because they have no
+                        # subsequent chunks to ahead-schedule. They go
+                        # directly to prefill_last_pending via the legacy
+                        # path, which routes by req_id and naturally
+                        # supports multi-request batches.
                         for req in self.running:
                             if req.request_id in scheduled_req_ids:
                                 num_scheduled = (
@@ -1509,6 +1576,42 @@ class PDSeparatedScheduler(Scheduler):
                                     - num_scheduled
                                 )
                                 is_last = remaining <= 0
+
+                                if (
+                                    is_last
+                                    and not self.limit_prefill_batch_size
+                                    and self._pending_tail_count.get(
+                                        req.request_id, 0
+                                    ) == 0
+                                ):
+                                    # Short request: no Flight tracking needed.
+                                    # PL return will fallback to legacy routing
+                                    # (_update_from_output_prefill_last_legacy)
+                                    # which routes by req_id and supports
+                                    # multi-request batches.
+                                    # Guard: only skip Flight when NO other chunk
+                                    # of this request is in flight
+                                    # (pending_tail == 0).  is_last alone is also
+                                    # True for a MULTI-chunk request's final
+                                    # chunk, which is dispatched while its
+                                    # earlier chunks are still in flight under
+                                    # 2P/ahead -- skipping that Flight would
+                                    # remove the "all chunks returned before
+                                    # decode" gate and let the request enter
+                                    # decode prematurely (KV incomplete).
+                                    self.prefill_last_pending.append(req)
+                                    logger.info(
+                                        "[PD-CHUNK-PRIOR] Short request %s "
+                                        "(head_token=%s, %d tokens) "
+                                        "→ prefill_last_pending (no Flight)"
+                                        "total_tokens = %d",
+                                        req.request_id,
+                                        scheduler_output.head_token,
+                                        num_scheduled,
+                                        scheduler_output.total_num_scheduled_tokens,
+                                    )
+                                    continue
+
                                 flight = PrefillChunkFlight(
                                     request_id=req.request_id,
                                     head_token=scheduler_output.head_token,
@@ -1653,6 +1756,25 @@ class PDSeparatedScheduler(Scheduler):
             logger.info(
                 "[PD-LIMIT-PREFILL] PREFILL_FIRST batch_size=%d, "
                 "total_tokens=%d, chunk_first_remaining=%d, waiting_remaining=%d",
+                len(scheduler_output.num_scheduled_tokens),
+                scheduler_output.total_num_scheduled_tokens,
+                len(self.chunk_prefill_first),
+                len(self.waiting),
+            )
+
+        # Observation point for "short-request batching": every real PREFILL_FIRST
+        # batch logs how many requests it contains.  batch_size > 1 means the
+        # decoupled short-request batching grouped multiple requests into one PF
+        # batch -- exactly what we want to confirm.
+        if (
+            scheduler_output is not None
+            and scheduler_output.total_num_scheduled_tokens > 0
+        ):
+            logger.info(
+                "[PD-PF-BATCH] comm_seqno=%s batch_type=%s batch_size=%d "
+                "total_tokens=%d chunk_first_remaining=%d waiting=%d",
+                getattr(scheduler_output, "comm_seqno", None),
+                getattr(scheduler_output, "batch_type", None),
                 len(scheduler_output.num_scheduled_tokens),
                 scheduler_output.total_num_scheduled_tokens,
                 len(self.chunk_prefill_first),
